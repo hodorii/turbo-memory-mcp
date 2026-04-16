@@ -2,6 +2,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Tuple
 
+# Precomputed Lloyd-Max centroids for Beta distribution in high dimensions (d=1 scale)
 _LLOYD_MAX_CENTROIDS: dict[int, np.ndarray] = {
     1: np.array([-0.7979, 0.7979]),
     2: np.array([-1.5104, -0.4528, 0.4528, 1.5104]),
@@ -18,9 +19,9 @@ _LLOYD_MAX_CENTROIDS: dict[int, np.ndarray] = {
 class TurboQuantState:
     dim: int
     bits: int
-    rotation: np.ndarray    # (dim, dim) random orthogonal matrix
-    centroids: np.ndarray   # Lloyd-Max codebook scaled for dim
-    qjl_matrix: np.ndarray  # (dim, dim) random Gaussian for QJL
+    rotation: np.ndarray    # (dim, dim) random orthogonal — maps x to near-Gaussian coords
+    centroids: np.ndarray   # Lloyd-Max codebook scaled by 1/sqrt(dim)
+    qjl_matrix: np.ndarray  # (dim, dim) random Gaussian — for 1-bit residual correction
 
 
 def build_state(dim: int, bits: int, seed: int = 42) -> TurboQuantState:
@@ -36,6 +37,7 @@ def _quantize_stage1(x: np.ndarray, state: TurboQuantState) -> Tuple[np.ndarray,
     norm = float(np.linalg.norm(x))
     if norm == 0:
         return np.zeros(state.dim, dtype=np.int32), 0.0
+    # Rotate to near-Gaussian distribution, then nearest-centroid quantize
     rotated = state.rotation @ (x / norm)
     idx = np.argmin(np.abs(rotated[:, None] - state.centroids[None, :]), axis=1).astype(np.int32)
     return idx, norm
@@ -49,6 +51,7 @@ def compress(x: np.ndarray, state: TurboQuantState) -> Tuple[np.ndarray, float, 
     idx, norm = _quantize_stage1(x, state)
     residual = x - _dequantize_stage1(idx, norm, state)
     r_norm = float(np.linalg.norm(residual))
+    # QJL: sign(S·r) gives unbiased 1-bit estimate of residual direction
     qjl = np.sign(state.qjl_matrix @ residual) if r_norm > 1e-12 else np.ones(state.dim)
     qjl[qjl == 0] = 1.0
     return idx, norm, qjl, r_norm
@@ -57,6 +60,8 @@ def compress(x: np.ndarray, state: TurboQuantState) -> Tuple[np.ndarray, float, 
 def estimate_inner_product(query: np.ndarray, state: TurboQuantState,
                            idx: np.ndarray, norm: float,
                            qjl: np.ndarray, r_norm: float) -> float:
+    # Stage 1: codebook inner product in rotated space
     stage1 = float(np.dot(state.centroids[idx], state.rotation @ query)) * norm
+    # Stage 2: QJL correction — E[sign(S·r)·sign(S·q)] = (2/π)·<r,q>/‖r‖‖q‖
     stage2 = (np.sqrt(np.pi / 2) / state.dim) * r_norm * float(np.dot(qjl, np.sign(state.qjl_matrix @ query)))
     return stage1 + stage2
