@@ -58,27 +58,19 @@ def _error(msg: str) -> dict:
 # ── Tool handlers ─────────────────────────────────────────────────────────────
 
 def handle_remember(params: dict) -> dict:
-    text = params.get("text", "").strip()
-    if not text:
-        return _error("text is required")
+    # Batch: {"texts": [...]} or single: {"text": "..."}
+    texts = params.get("texts") or ([params.get("text", "").strip()] if params.get("text") else None)
+    if not texts:
+        return _error("text or texts is required")
 
-    raw_emb = params.get("embedding")
-    if raw_emb is not None:
-        emb = np.array(raw_emb, dtype=np.float32)
-        if emb.shape != (DIM,):
-            return _error(f"embedding must have dim={DIM}")
-        norm = np.linalg.norm(emb)
-        if norm > 0:
-            emb = emb / norm
-    else:
-        emb = _text_to_embedding(text)
-
-    entry_id = store.add(text, emb)
+    model = _get_model()
+    embeddings = model.encode(texts, normalize_embeddings=True, batch_size=64)
+    ids = [store.add(t, e.astype("float32")) for t, e in zip(texts, embeddings)]
     try:
         store.save(STORE_PATH)
     except OSError:
-        pass  # in-memory only if disk full
-    return {"id": entry_id, "stored": True}
+        pass
+    return {"ids": ids, "stored": len(ids)}
 
 
 def handle_recall(params: dict) -> dict:
@@ -134,17 +126,13 @@ HANDLERS = {
 TOOLS = [
     {
         "name": "remember",
-        "description": "Store a memory with TurboQuant-compressed embedding (~9x compression, zero accuracy loss). Uses all-MiniLM-L6-v2 for semantic embeddings.",
+        "description": "Store one or multiple memories with TurboQuant-compressed embeddings (~10x compression). Pass 'texts' array for batch (single encode pass, much faster).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "text": {"type": "string", "description": "Text to remember"},
-                "embedding": {
-                    "type": "array", "items": {"type": "number"},
-                    "description": f"Optional float32 embedding of dim={DIM}. Auto-generated if omitted."
-                },
+                "text":  {"type": "string", "description": "Single text to remember"},
+                "texts": {"type": "array", "items": {"type": "string"}, "description": "Batch of texts (preferred for multiple memories)"},
             },
-            "required": ["text"],
         },
     },
     {
