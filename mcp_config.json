@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "memory": {
+      "command": "python",
+      "args": ["server.py"],
+      "cwd": "/home/hodorii/dev/prj1"
+    }
+  }
+}
