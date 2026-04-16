@@ -1,107 +1,88 @@
 """
 Compressed vector memory store using TurboQuant.
-
-Stores (text, compressed_embedding) pairs and supports
-similarity search via inner-product estimation.
+Storage: SQLite with WAL mode (safe for multi-process access).
+Search: direct inner-product estimation on compressed representation (no dequant).
 """
-import json
-import pickle
+import sqlite3
 import numpy as np
-from pathlib import Path
-from typing import List, Tuple, Optional
-from dataclasses import dataclass, field
+from typing import List, Tuple
 
-from turbo_quant import TurboQuantState, build_turbo_quant, quant_prod, dequant_prod
+from turbo_quant import TurboQuantState, build_turbo_quant, quant_prod, inner_prod_compressed
 
-
-@dataclass
-class MemoryEntry:
-    id: str
-    text: str
-    # Compressed representation
-    idx: np.ndarray    # MSE quantization indices
-    norm: float        # L2 norm of original vector
-    qjl: np.ndarray   # QJL sign bits
-    r_norm: float      # residual norm
+# TurboQuantState is deterministic given (dim, bits, seed) — no need to persist matrices.
+_DEFAULT_SEED = 42
 
 
 class CompressedMemoryStore:
-    """
-    Memory store that compresses embeddings with TurboQuant.
-
-    Compression ratio: bits/16 (e.g., 3-bit → ~5x vs FP16)
-    Inner-product queries remain unbiased due to QJL correction.
-    """
-
-    def __init__(self, dim: int, bits: int = 3, seed: int = 42):
+    def __init__(self, path: str, dim: int = 384, bits: int = 3):
         self.dim = dim
         self.bits = bits
-        self.state: TurboQuantState = build_turbo_quant(dim, bits, seed)
-        self.entries: List[MemoryEntry] = []
-        self._counter = 0
+        self.path = path
+        self.state: TurboQuantState = build_turbo_quant(dim, bits, _DEFAULT_SEED)
+        self._db = self._open(path)
+
+    def _open(self, path: str) -> sqlite3.Connection:
+        db = sqlite3.connect(path, check_same_thread=False)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS entries (
+                id      TEXT PRIMARY KEY,
+                text    TEXT NOT NULL,
+                idx     BLOB NOT NULL,
+                norm    REAL NOT NULL,
+                qjl     BLOB NOT NULL,
+                r_norm  REAL NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        db.commit()
+        return db
+
+    def _next_id(self) -> str:
+        row = self._db.execute("SELECT COUNT(*) FROM entries").fetchone()
+        return f"mem_{row[0]:06d}"
 
     def add(self, text: str, embedding: np.ndarray) -> str:
-        """Compress and store an embedding. Returns entry id."""
-        assert embedding.shape == (self.dim,), f"Expected dim={self.dim}"
         idx, norm, qjl, r_norm = quant_prod(embedding, self.state)
-        entry_id = f"mem_{self._counter:06d}"
-        self._counter += 1
-        self.entries.append(MemoryEntry(
-            id=entry_id, text=text,
-            idx=idx, norm=norm, qjl=qjl, r_norm=r_norm,
-        ))
+        entry_id = self._next_id()
+        self._db.execute(
+            "INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?)",
+            (entry_id, text,
+             idx.astype(np.int8).tobytes(), float(norm),
+             np.sign(qjl).astype(np.int8).tobytes(), float(r_norm))
+        )
+        self._db.commit()
         return entry_id
 
     def search(self, query: np.ndarray, top_k: int = 5) -> List[Tuple[str, str, float]]:
-        """
-        Find top-k most similar entries using inner-product estimation.
-        Returns list of (id, text, score).
-        """
-        if not self.entries:
+        rows = self._db.execute("SELECT id, text, idx, norm, qjl, r_norm FROM entries").fetchall()
+        if not rows:
             return []
 
         scores = []
-        for entry in self.entries:
-            x_hat = dequant_prod(entry.idx, entry.norm, entry.qjl, entry.r_norm, self.state)
-            score = float(np.dot(query, x_hat))
-            scores.append((entry.id, entry.text, score))
+        for row_id, text, idx_blob, norm, qjl_blob, r_norm in rows:
+            idx = np.frombuffer(idx_blob, dtype=np.int8).astype(np.int32)
+            qjl = np.frombuffer(qjl_blob, dtype=np.int8).astype(np.float32)
+            score = inner_prod_compressed(query, self.state, idx, norm, qjl, r_norm)
+            scores.append((row_id, text, score))
 
         scores.sort(key=lambda x: x[2], reverse=True)
         return scores[:top_k]
 
     def delete(self, entry_id: str) -> bool:
-        before = len(self.entries)
-        self.entries = [e for e in self.entries if e.id != entry_id]
-        return len(self.entries) < before
-
-    def save(self, path: str):
-        data = {
-            "dim": self.dim,
-            "bits": self.bits,
-            "counter": self._counter,
-            "state": self.state,
-            "entries": self.entries,
-        }
-        with open(path, "wb") as f:
-            pickle.dump(data, f)
-
-    @classmethod
-    def load(cls, path: str) -> "CompressedMemoryStore":
-        with open(path, "rb") as f:
-            data = pickle.load(f)
-        store = cls.__new__(cls)
-        store.dim = data["dim"]
-        store.bits = data["bits"]
-        store._counter = data["counter"]
-        store.state = data["state"]
-        store.entries = data["entries"]
-        return store
+        cur = self._db.execute("DELETE FROM entries WHERE id=?", (entry_id,))
+        self._db.commit()
+        return cur.rowcount > 0
 
     def stats(self) -> dict:
-        n = len(self.entries)
-        # bits per entry: (bits-1)*dim (MSE idx) + dim (QJL) + 32+32 (norm, r_norm)
+        n = self._db.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
         compressed_bits = n * ((self.bits - 1) * self.dim + self.dim + 64)
-        original_bits = n * self.dim * 32  # FP32
+        original_bits = n * self.dim * 32
         return {
             "entries": n,
             "dim": self.dim,

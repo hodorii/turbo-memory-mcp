@@ -42,7 +42,7 @@ python3 -m venv .venv
 
 ## MCP 등록
 
-`~/.kiro/settings/mcp.json`, `~/.gemini/settings.json`, `~/.gemini/antigravity/mcp_config.json` 중 원하는 클라이언트에 추가:
+`~/.kiro/settings/mcp.json`, `~/.gemini/settings.json`, `~/.gemini/antigravity/mcp_config.json`, `~/.config/opencode/mcp-servers.json` 중 원하는 클라이언트에 추가:
 
 ```json
 "memory": {

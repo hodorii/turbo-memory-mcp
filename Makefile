@@ -1,14 +1,16 @@
 PROJ    := $(shell pwd)
 PYTHON  := $(PROJ)/.venv/bin/python
 PIP     := $(PROJ)/.venv/bin/pip
+UVX     := uvx --from $(PROJ)
 
 KIRO_MCP        := $(HOME)/.kiro/settings/mcp.json
 GEMINI_MCP      := $(HOME)/.gemini/settings.json
 ANTIGRAVITY_MCP := $(HOME)/.gemini/antigravity/mcp_config.json
+OPENCODE_CFG    := $(HOME)/.config/opencode/opencode.json
 GEMINI_CTX      := $(HOME)/.gemini/gemini.md
 ANTIGRAVITY_CTX := $(HOME)/.gemini/antigravity/scratch/antigravity_agent_prompt.md
 
-.PHONY: all install register unregister ingest test clean
+.PHONY: all install register unregister ingest test serve clean
 
 all: install register
 
@@ -19,20 +21,24 @@ install:
 	@echo "✓ 설치 완료"
 
 # ── MCP 등록 (jq로 JSON 병합) ─────────────────────────────────────────────────
-register: _register_kiro _register_gemini _register_antigravity _register_skills
-	@echo "✓ 등록 완료 (kiro / gemini / antigravity)"
+register: _register_kiro _register_gemini _register_antigravity _register_opencode _register_skills
+	@echo "✓ 등록 완료 (kiro / gemini / antigravity / opencode)"
 
 _register_kiro:
-	@jq '.mcpServers.memory = {"command":"$(PYTHON)","args":["$(PROJ)/server.py"]}' \
+	@jq '.mcpServers.memory = {"command":"uvx","args":["--from","$(PROJ)","turbo-memory-mcp"]}' \
 		$(KIRO_MCP) > /tmp/_mcp.json && mv /tmp/_mcp.json $(KIRO_MCP)
 
 _register_gemini:
-	@jq '.mcpServers.memory = {"command":"$(PYTHON)","args":["$(PROJ)/server.py"]}' \
+	@jq '.mcpServers.memory = {"command":"uvx","args":["--from","$(PROJ)","turbo-memory-mcp"]}' \
 		$(GEMINI_MCP) > /tmp/_mcp.json && mv /tmp/_mcp.json $(GEMINI_MCP)
 
 _register_antigravity:
-	@jq '.mcpServers.memory = {"command":"$(PYTHON)","args":["$(PROJ)/server.py"]}' \
+	@jq '.mcpServers.memory = {"command":"uvx","args":["--from","$(PROJ)","turbo-memory-mcp"]}' \
 		$(ANTIGRAVITY_MCP) > /tmp/_mcp.json && mv /tmp/_mcp.json $(ANTIGRAVITY_MCP)
+
+_register_opencode:
+	@jq '.mcp.memory = {"command":["uvx","--from","$(PROJ)","turbo-memory-mcp"],"enabled":true,"type":"local"}' \
+		$(OPENCODE_CFG) > /tmp/_mcp.json && mv /tmp/_mcp.json $(OPENCODE_CFG)
 
 _register_skills:
 	@mkdir -p $(PROJ)/.kiro/steering
@@ -47,12 +53,17 @@ unregister:
 	@for f in $(KIRO_MCP) $(GEMINI_MCP) $(ANTIGRAVITY_MCP); do \
 		jq 'del(.mcpServers.memory)' $$f > /tmp/_mcp.json && mv /tmp/_mcp.json $$f; \
 	done
+	@jq 'del(.mcp.memory)' $(OPENCODE_CFG) > /tmp/_mcp.json && mv /tmp/_mcp.json $(OPENCODE_CFG)
 	@echo "✓ 등록 해제 완료"
 
 # ── 배치 ingest ───────────────────────────────────────────────────────────────
 ingest:
 	@test -n "$(FILE)" || (echo "사용법: make ingest FILE=memories.json" && exit 1)
 	$(PYTHON) ingest.py $(FILE)
+
+# ── HTTP 서버 실행 ─────────────────────────────────────────────────────────────
+serve:
+	$(UVX) turbo-memory-mcp --http $(or $(PORT),8765)
 
 # ── 동작 테스트 ───────────────────────────────────────────────────────────────
 test:
@@ -65,4 +76,4 @@ test:
 
 # ── 정리 ──────────────────────────────────────────────────────────────────────
 clean:
-	rm -rf .venv __pycache__ memory.pkl
+	rm -rf .venv __pycache__ memory.db memory.pkl.bak

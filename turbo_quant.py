@@ -111,6 +111,15 @@ def dequant_prod(idx: np.ndarray, norm: float,
                  qjl: np.ndarray, r_norm: float,
                  state: TurboQuantState) -> np.ndarray:
     x_hat_mse = dequant_mse(idx, norm, state)
-    # QJL dequant: (sqrt(π/2) / d) * γ * S^T * qjl
     x_hat_qjl = (np.sqrt(np.pi / 2) / state.d) * r_norm * (state.S.T @ qjl)
     return x_hat_mse + x_hat_qjl
+
+
+def inner_prod_compressed(query: np.ndarray, state: TurboQuantState,
+                          idx: np.ndarray, norm: float,
+                          qjl: np.ndarray, r_norm: float) -> float:
+    """Estimate inner product directly from compressed representation (no dequant)."""
+    q_rot = state.Pi @ query
+    s1 = float(np.dot(state.centroids[idx], q_rot)) * norm
+    s2 = (np.sqrt(np.pi / 2) / state.d) * r_norm * float(np.dot(qjl, np.sign(state.S @ query)))
+    return s1 + s2

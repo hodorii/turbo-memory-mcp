@@ -19,29 +19,29 @@ from memory_store import CompressedMemoryStore
 # ── Config ────────────────────────────────────────────────────────────────────
 DIM = 384       # all-MiniLM-L6-v2 output dimension
 BITS = 3        # TurboQuant bit-width (3-bit, ~9x compression)
-STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory.pkl")
+STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory.db")
 
-# Lazy-load embedding model
-_model = None
+# Eager-load embedding model at startup
+from sentence_transformers import SentenceTransformer
+_model = SentenceTransformer('all-MiniLM-L6-v2')
+
 def _get_model():
-    global _model
-    if _model is None:
-        from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer('all-MiniLM-L6-v2')
     return _model
 
+# Query embedding cache (text → normalized embedding)
+_emb_cache: dict = {}
+def _cached_encode(text: str) -> np.ndarray:
+    if text not in _emb_cache:
+        v = _model.encode(text, normalize_embeddings=True)
+        _emb_cache[text] = v.astype(np.float32)
+    return _emb_cache[text]
+
 # ── Global store ─────────────────────────────────────────────────────────────
-try:
-    store = CompressedMemoryStore.load(STORE_PATH)
-    if store.dim != DIM or store.bits != BITS:
-        store = CompressedMemoryStore(dim=DIM, bits=BITS)
-except Exception:
-    store = CompressedMemoryStore(dim=DIM, bits=BITS)
+store = CompressedMemoryStore(path=STORE_PATH, dim=DIM, bits=BITS)
 
 
 def _text_to_embedding(text: str) -> np.ndarray:
-    v = _get_model().encode(text, normalize_embeddings=True)
-    return v.astype(np.float32)
+    return _cached_encode(text)
 
 
 # ── MCP protocol helpers ──────────────────────────────────────────────────────
@@ -167,9 +167,54 @@ TOOLS = [
     },
 ]
 
-# ── MCP main loop (JSON-RPC over stdio) ───────────────────────────────────────
+# ── JSON-RPC request handler (shared by stdio and http) ──────────────────────
 
-def main():
+def _handle_request(req: dict) -> dict | None:
+    req_id = req.get("id")
+    method = req.get("method", "")
+    params = req.get("params", {})
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0", "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "memory-mcp", "version": "1.0.0"},
+            },
+        }
+    elif method == "tools/list":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
+    elif method == "tools/call":
+        tool_name = params.get("name")
+        tool_params = params.get("arguments", {})
+        handler = HANDLERS.get(tool_name)
+        if handler is None:
+            result = _error(f"Unknown tool: {tool_name}")
+        else:
+            try:
+                result = handler(tool_params)
+            except Exception as e:
+                result = _error(str(e))
+        return {
+            "jsonrpc": "2.0", "id": req_id,
+            "result": {
+                "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                "isError": "error" in result,
+            },
+        }
+    elif method == "notifications/initialized":
+        return None  # no response
+    else:
+        return {
+            "jsonrpc": "2.0", "id": req_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"},
+        }
+
+
+# ── stdio mode ────────────────────────────────────────────────────────────────
+
+def run_stdio():
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -178,54 +223,56 @@ def main():
             req = json.loads(line)
         except json.JSONDecodeError:
             continue
+        resp = _handle_request(req)
+        if resp is not None:
+            _send(resp)
 
-        req_id = req.get("id")
-        method = req.get("method", "")
-        params = req.get("params", {})
 
-        # ── Initialization ──
-        if method == "initialize":
-            _send({
-                "jsonrpc": "2.0", "id": req_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "memory-mcp", "version": "1.0.0"},
-                },
-            })
+# ── HTTP mode ─────────────────────────────────────────────────────────────────
 
-        elif method == "tools/list":
-            _send({"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}})
+def run_http(host: str = "127.0.0.1", port: int = 8765):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
 
-        elif method == "tools/call":
-            tool_name = params.get("name")
-            tool_params = params.get("arguments", {})
-            handler = HANDLERS.get(tool_name)
-            if handler is None:
-                result = _error(f"Unknown tool: {tool_name}")
-            else:
-                try:
-                    result = handler(tool_params)
-                except Exception as e:
-                    result = _error(str(e))
+    class MCPHandler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass  # suppress access logs
 
-            _send({
-                "jsonrpc": "2.0", "id": req_id,
-                "result": {
-                    "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
-                    "isError": "error" in result,
-                },
-            })
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                req = json.loads(body)
+            except json.JSONDecodeError:
+                self.send_response(400)
+                self.end_headers()
+                return
+            resp = _handle_request(req)
+            payload = json.dumps(resp).encode() if resp is not None else b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(payload))
+            self.end_headers()
+            self.wfile.write(payload)
 
-        elif method == "notifications/initialized":
-            pass  # no response needed
+    server = HTTPServer((host, port), MCPHandler)
+    print(f"memory-mcp HTTP ready on {host}:{port}", file=sys.stderr, flush=True)
+    server.serve_forever()
 
-        else:
-            _send({
-                "jsonrpc": "2.0", "id": req_id,
-                "error": {"code": -32601, "message": f"Method not found: {method}"},
-            })
 
+# ── entrypoint ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    if "--http" in sys.argv:
+        port = int(sys.argv[sys.argv.index("--http") + 1]) if len(sys.argv) > sys.argv.index("--http") + 1 else 8765
+        run_http(port=port)
+    else:
+        run_stdio()
+
+
+def main():
+    if "--http" in sys.argv:
+        port = int(sys.argv[sys.argv.index("--http") + 1]) if len(sys.argv) > sys.argv.index("--http") + 1 else 8765
+        run_http(port=port)
+    else:
+        run_stdio()
