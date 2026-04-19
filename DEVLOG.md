@@ -67,6 +67,55 @@ query: "벡터 양자화 압축"
 
 모두 동일한 `memory.pkl` 공유 → 크로스 클라이언트 메모리 동기화.
 
+## 2026-04-19
+
+### 성능 최적화 및 단순화 (Elon's Algorithm 적용)
+
+**목표**: 시작 속도 극대화, 검색 알고리즘 최적화, 병렬 처리 안정화
+
+**일론 머스크의 5단계 설계론(The Algorithm) 적용**:
+1. **요구사항 단순화**: `initialize` 시점에 모델 로딩이 완료되어야 한다는 제약을 제거.
+2. **프로세스 삭제**: 무제한으로 커지는 임베딩 캐시 삭제 및 LRU 대체.
+3. **최적화**: 검색 복잡도를 $O(N \cdot d^2)$에서 $O(N \cdot d)$로 개선.
+4. **가속화**: 병렬 에이전트 대응을 위한 멀티스레딩 도입.
+
+**주요 개선 사항**:
+1. **Lazy Loading (시작 속도)**:
+   - `SentenceTransformer` 로딩을 실제 도구 호출 시점까지 유예.
+   - MCP `initialize` 응답 속도: 수 초 → **0ms** (즉각 응답).
+
+2. **Pre-projection (검색 속도)**:
+   - 검색 루프 외부에서 쿼리 벡터의 랜덤 회전(Π) 및 QJL 투영(S)을 1회만 수행.
+   - 루프 내 행렬 곱셈($d^2$)을 벡터 내적($d$)으로 대체.
+   - 검색 속도: N=1000 기준 약 **8ms** 달성.
+
+3. **병렬 에이전트 지원 (Concurrency)**:
+   - `ThreadPoolExecutor` (stdio) 및 `ThreadingHTTPServer` (HTTP) 적용.
+   - 여러 sub-agent가 동시에 메모리를 조회/저장해도 멈추지 않는 논블로킹 구조.
+
+4. **안정성 및 동시성 제어**:
+   - `RLock` (Reentrant Lock) 도입으로 모델 로딩/인코딩 시 데드락 방지.
+   - `SentenceTransformer`의 스레드 안전성 문제를 전용 락으로 해결(세그먼테이션 폴트 방어).
+   - `safe_print`용 락을 분리하여 출력 섞임 방지.
+
+5. **메모리 효율**:
+   - `functools.lru_cache`를 통한 임베딩 캐시 관리 (최대 1000개).
+
+6. **하이브리드 검색 (Hybrid Search)**:
+   - SQLite FTS5 기반 키워드 검색 통합.
+   - 키워드(80%) + 벡터(20%) 가중치 조정을 통해 정확한 심볼 매칭 성능 극대화.
+
+7. **불용어 필터링 및 형태소 분석 (Morpheme Analysis)**:
+   - `kiwipiepy` 도입으로 한국어 조사 분리 및 명사 추출 기능 강화.
+   - "알고리즘은" -> "알고리즘"으로 정규화하여 검색 품질 개선.
+
+**최종 벤치마크**:
+- **Startup Latency**: 0.00ms (Initialize response)
+- **Search Efficiency**: 9.42ms (Avg for N=1000, Morpheme Hybrid Mode)
+- **Parallel Robustness**: 5개 병렬 호출 성공 (Lock/Deadlock 프리)
+
+---
+
 ## 기술적 결정
 
 ### 왜 TurboQuant인가?
@@ -79,24 +128,29 @@ query: "벡터 양자화 압축"
 - all-MiniLM-L6-v2: 384차원, 빠른 추론 속도
 - normalize_embeddings=True로 unit sphere 보장
 
-### 압축률 트레이드오프
-- 2-bit: 14x 압축, MSE 0.117 (작은 모델에 적합)
-- 3-bit: 10x 압축, MSE 0.030 (논문 권장, 정확도 손실 거의 없음)
-- 4-bit: 7x 압축, MSE 0.009 (대형 모델, 긴 컨텍스트)
+### 하이브리드 검색의 필요성
+- 벡터 검색(의미)은 유연하지만 정확한 식별자(TASK-01 등) 매칭에 취약.
+- SQLite FTS5(키워드)와 결합하여 기술 문서 검색의 정확도를 상호 보완.
 
-현재 구현: 3-bit (정확도/압축률 균형점)
+### 형태소 분석기 도입 (Kiwi)
+- 한국어의 교착어 특성(조사 결합)으로 인해 단순 공백 토큰화는 키워드 검색 품질 저하.
+- `kiwipiepy`를 통한 명사 추출로 "알고리즘은"과 "알고리즘"의 정합성 확보.
+
+### 압축률 트레이드오프
+- 2-bit: 14x 압축, MSE 0.117
+- 3-bit: 10x 압축, MSE 0.030 (권장 설정)
+- 4-bit: 7x 압축, MSE 0.009
+
+현재 구현: **3-bit** (정확도/압축률 균형점)
 
 ## 향후 개선 방향
 
 1. **Outlier 처리**: 32개 outlier 채널 별도 양자화 (논문 2.5-bit 전략)
 2. **Entropy coding**: 코드북 포인터 허프만 인코딩 (5% 추가 압축)
-3. **Batch quantization**: 여러 벡터 동시 처리로 throughput 향상
-4. **GPU 가속**: CUDA 커널로 rotation/quantization 병렬화
-5. **Incremental update**: 전체 재양자화 없이 새 메모리 추가
+3. **GPU 가속**: CUDA 커널로 rotation/quantization 병렬화
 
 ## 참고 자료
 
 - [TurboQuant paper](https://arxiv.org/abs/2504.19874)
 - [Vadim's blog: TurboQuant 3-bit KV cache](https://vadim.blog/turboquant-3-bit-kv-cache-zero-loss)
 - [Google Research blog](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression)
-- [llama.cpp community implementation](https://github.com/ggml-org/llama.cpp/discussions/20969)

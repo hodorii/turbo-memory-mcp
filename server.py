@@ -2,6 +2,10 @@ import json
 import sys
 import os
 import numpy as np
+import threading
+from typing import Optional
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 from sentence_transformers import SentenceTransformer
 
 from memory_store import MemoryStore
@@ -10,22 +14,119 @@ STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory.db
 DIM = 384
 BITS = 3
 
-_encoder = SentenceTransformer('all-MiniLM-L6-v2')
-_encode_cache: dict[str, np.ndarray] = {}
+_encoder: Optional[SentenceTransformer] = None
+_model_lock = threading.RLock() # 동일 스레드 재진입 허용
+_print_lock = threading.Lock() # 출력용 락 분리
+_executor = ThreadPoolExecutor(max_workers=10)
 store = MemoryStore(path=STORE_PATH, dim=DIM, bits=BITS)
 
 
+def get_encoder() -> SentenceTransformer:
+    global _encoder
+    if _encoder is None:
+        with _model_lock:
+            if _encoder is None:
+                _encoder = SentenceTransformer('all-MiniLM-L6-v2')
+    return _encoder
+
+
+@lru_cache(maxsize=1000)
 def encode(text: str) -> np.ndarray:
-    if text not in _encode_cache:
-        _encode_cache[text] = _encoder.encode(text, normalize_embeddings=True).astype(np.float32)
-    return _encode_cache[text]
+    with _model_lock:
+        return get_encoder().encode(text, normalize_embeddings=True).astype(np.float32)
 
 
 def encode_batch(texts: list[str]) -> np.ndarray:
-    return _encoder.encode(texts, normalize_embeddings=True, batch_size=64).astype(np.float32)
+    with _model_lock:
+        return get_encoder().encode(texts, normalize_embeddings=True, batch_size=64).astype(np.float32)
 
 
-# ── Tool handlers ─────────────────────────────────────────────────────────────
+def safe_print(data: str):
+    with _print_lock:
+        sys.stdout.write(data + "\n")
+        sys.stdout.flush()
+
+# ... (handlers unchanged) ...
+
+def dispatch(req: dict) -> Optional[dict]:
+    method = req.get("method")
+    params = req.get("params", {})
+    req_id = req.get("id")
+
+    try:
+        if method == "initialize":
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "serverInfo": {"name": "turbo-memory-mcp", "version": "0.1.0"},
+                    "instructions": "TurboQuant-compressed vector memory store for MCP.",
+                }
+            }
+        elif method == "tools/list":
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"tools": TOOLS}
+            }
+        elif method == "tools/call":
+            tool_name = params.get("name")
+            tool_params = params.get("arguments", {})
+            if tool_name in HANDLERS:
+                res = HANDLERS[tool_name](tool_params)
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}],
+                        "isError": False
+                    }
+                }
+            return error(f"Unknown tool: {tool_name}", req_id)
+        
+        return None # Notifications (e.g. initialized)
+    except Exception as e:
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32000, "message": str(e)},
+            "isError": True
+        }
+
+
+def run_stdio():
+    def worker(line):
+        try:
+            req = json.loads(line)
+            resp = dispatch(req)
+            if resp:
+                safe_print(json.dumps(resp, ensure_ascii=False))
+        except:
+            pass
+
+    for line in sys.stdin:
+        if line.strip():
+            _executor.submit(worker, line)
+
+
+def run_http(port: int):
+    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+    
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            content_length = int(self.headers['Content-Length'])
+            req = json.loads(self.rfile.read(content_length))
+            resp = dispatch(req)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp, ensure_ascii=False).encode('utf-8'))
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    safe_print(f"Server starting on http://127.0.0.1:{port} (Parallel Mode)")
+    server.serve_forever()
 
 def handle_remember(params: dict) -> dict:
     texts = params.get("texts") or ([params["text"].strip()] if params.get("text") else None)
@@ -47,7 +148,8 @@ def handle_recall(params: dict) -> dict:
             q /= n
     else:
         q = encode(query)
-    results = store.search(q, top_k=int(params.get("top_k", 5)))
+    # Pass both query text and vector for hybrid (Vector + FTS5) search
+    results = store.search(query, q, top_k=int(params.get("top_k", 5)))
     return {"results": [{"id": r[0], "text": r[1], "score": round(r[2], 4)} for r in results]}
 
 
@@ -112,7 +214,7 @@ def error(msg: str) -> dict:
     return {"error": {"message": msg}}
 
 
-def dispatch(req: dict) -> dict | None:
+def dispatch(req: dict) -> Optional[dict]:
     req_id, method, params = req.get("id"), req.get("method", ""), req.get("params", {})
 
     if method == "initialize":

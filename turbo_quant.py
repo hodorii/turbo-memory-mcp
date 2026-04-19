@@ -57,11 +57,39 @@ def compress(x: np.ndarray, state: TurboQuantState) -> Tuple[np.ndarray, float, 
     return idx, norm, qjl, r_norm
 
 
-def estimate_inner_product(query: np.ndarray, state: TurboQuantState,
+def prepare_query(query: np.ndarray, state: TurboQuantState) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Precompute projections once per search to achieve O(d) in the inner loop.
+    
+    1. Rotation (Π·q): Maps query to the same near-Gaussian space as Stage 1 centroids.
+    2. QJL Projection (S·q): For Stage 2 residual correction using 1-bit signs.
+    """
+    q_rot = state.rotation @ query
+    q_qjl = np.sign(state.qjl_matrix @ query)
+    q_qjl[q_qjl == 0] = 1.0
+    return q_rot, q_qjl
+
+
+def estimate_inner_product(state: TurboQuantState,
+                           q_rot: np.ndarray, q_qjl: np.ndarray,
                            idx: np.ndarray, norm: float,
                            qjl: np.ndarray, r_norm: float) -> float:
-    # Stage 1: codebook inner product in rotated space
-    stage1 = float(np.dot(state.centroids[idx], state.rotation @ query)) * norm
-    # Stage 2: QJL correction — E[sign(S·r)·sign(S·q)] = (2/π)·<r,q>/‖r‖‖q‖
-    stage2 = (np.sqrt(np.pi / 2) / state.dim) * r_norm * float(np.dot(qjl, np.sign(state.qjl_matrix @ query)))
+    """
+    Unbiased inner product estimation in the compressed domain.
+    
+    Stage 1: <centroids[idx], Π·q> * ‖x‖
+       - Computes the inner product using MSE-optimized Lloyd-Max centroids.
+       - Exploits that Π is orthogonal, so <x, q> = <Πx, Πq>.
+    
+    Stage 2: (√(π/2)/d) * ‖r‖ * <qjl, sign(S·q)>
+       - QJL (Quantized Johnson-Lindenstrauss) correction for the residual r.
+       - Based on the property: E[sign(S·r) · sign(S·q)] = (2/π) * <r,q> / (‖r‖‖q‖).
+       - This makes the overall estimation unbiased: E[Est] = <x, q>.
+    """
+    # Stage 1: O(d) vector-vector dot product
+    stage1 = float(np.dot(state.centroids[idx], q_rot)) * norm
+    
+    # Stage 2: O(d) correction using residual signs
+    stage2 = (np.sqrt(np.pi / 2) / state.dim) * r_norm * float(np.dot(qjl, q_qjl))
+    
     return stage1 + stage2

@@ -1,0 +1,12 @@
+{
+  "last_session_id": "1844bd33-1e22-4e1f-9f8a-bb0ba76290d8",
+  "last_event_key": "1844bd33-1e22-4e1f-9f8a-bb0ba76290d8:transcript:6c6a13a06384bfad6cfd00375c1f41dc3c8454176a4b35ecb1f87ef9c2c06152",
+  "last_prompted_session_id": "1844bd33-1e22-4e1f-9f8a-bb0ba76290d8",
+  "last_reason": "already-prompted-this-session",
+  "last_prompted_at": "2026-04-19T08:46:12.894Z",
+  "last_user_message_count": 26,
+  "last_actionable_message_count": 1,
+  "deep_interview_lock_active": false,
+  "deep_interview_lock_source": "/Users/hodorii/dev/turbo-memory-mcp/.omg/state/deep-interview.json",
+  "updated_at": "2026-04-19T10:22:41.110Z"
+}
