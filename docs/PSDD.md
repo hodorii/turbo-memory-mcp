@@ -63,7 +63,7 @@ Feature 정의
   ↓
 requirements.md (EARS: When ... the system shall ...)
   ↓
-biz-process.md (Process→Task→FG→Step→DetailStep→Logic)
+biz-process.md (Process→Task→FG→Step→DetailStep→Logic(AST))
   ↓
 uis.md (입출력 스키마, 에러 케이스)
   ↓

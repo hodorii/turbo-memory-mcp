@@ -1,92 +1,70 @@
 import time
-import json
 import numpy as np
 import os
-import sys
+from memory_store import MemoryStore
+from datetime import datetime, timedelta
 
-# Add current dir to path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-def test_startup_latency():
-    print("--- 1. Startup Latency Test ---")
-    start = time.perf_counter()
-    import server
-    # The moment of 'import' or 'server.store' creation should be fast now
-    end = time.perf_counter()
-    print(f"Server module load time: {(end - start) * 1000:.2f}ms")
+def run_benchmark(n_entries=100000):
+    db_path = "bench_test.db"
+    if os.path.exists(db_path):
+        os.remove(db_path)
     
-    start = time.perf_counter()
-    # Mock initialize
-    res = server.dispatch({"method": "initialize", "id": 1})
-    end = time.perf_counter()
-    print(f"Initialize response time (Lazy): {(end - start) * 1000:.2f}ms")
-    assert (end - start) < 0.5, "Initialize should be under 500ms"
-
-def test_search_efficiency(n_items=1000):
-    print(f"\n--- 2. Search Efficiency Test (N={n_items}) ---")
-    import server
-    from memory_store import MemoryStore
+    store = MemoryStore(db_path)
+    print(f"--- Lifelong Memory Benchmark ({n_entries} entries) ---")
     
-    test_db = "bench_test.db"
-    if os.path.exists(test_db): os.remove(test_db)
+    # 1. Data Generation & Ingestion
+    print(f"Injecting {n_entries} entries...")
+    start_time = time.time()
     
-    store = MemoryStore(path=test_db)
-    dim = 384
-    
-    print(f"Inserting {n_items} random vectors...")
-    texts = [f"text_{i}" for i in range(n_items)]
-    # Use random vectors to avoid model loading in this step
-    embs = np.random.randn(n_items, dim).astype(np.float32)
-    embs /= np.linalg.norm(embs, axis=1, keepdims=True)
-    
-    for t, e in zip(texts, embs):
-        store.add(t, e)
+    # Batch injection for speed
+    batch_size = 5000
+    for i in range(0, n_entries, batch_size):
+        for j in range(batch_size):
+            idx = i + j
+            text = f"This is a dummy memory entry number {idx} for benchmarking."
+            # Random vector (384-dim)
+            vec = np.random.randn(384).astype(np.float32)
+            vec /= np.linalg.norm(vec)
+            
+            # Varying metadata and timestamps
+            category = "work" if idx % 2 == 0 else "personal"
+            # Spread timestamps over last 10 years
+            days_ago = np.random.randint(0, 3650)
+            dt = datetime.now() - timedelta(days=days_ago)
+            dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Direct insert to bypass encoding but test store logic
+            # Using current date if needed, but the point is to test ingestion speed
+            store.add(text, vec, metadata={"category": category}, importance=np.random.random())
         
-    query = np.random.randn(dim).astype(np.float32)
-    query /= np.linalg.norm(query)
-    
-    # Warmup
-    store.search(query_text="random", query_vec=query, top_k=5)
-    
-    start = time.perf_counter()
-    iterations = 10
-    for _ in range(iterations):
-        results = store.search(query_text="random", query_vec=query, top_k=5)
-    end = time.perf_counter()
-    
-    avg_ms = ((end - start) / iterations) * 1000
-    print(f"Average search time for N={n_items}: {avg_ms:.2f}ms")
-    
-    # Simple O(N*d) vs O(N*d^2) check:
-    # 1000 items, 384 dim. O(N*d) is ~384,000 ops.
-    # Should be well under 50ms on modern CPU.
-    assert avg_ms < 100, "Search is too slow, check O(N*d) optimization"
+        store.commit()
+        print(f"Progress: {idx+1}/{n_entries} ({(idx+1)/n_entries*100:.1f}%)")
 
-    if os.path.exists(test_db): os.remove(test_db)
+    ingest_time = time.time() - start_time
+    print(f"Ingestion finished in {ingest_time:.2f}s (Avg: {ingest_time/n_entries*1000:.2f}ms/entry)")
+    print(f"DB Size: {os.path.getsize(db_path) / 1024 / 1024:.2f} MB")
 
-def test_parallel_execution():
-    print("\n--- 3. Parallel Execution Test ---")
-    import server
-    import threading
+    # 2. Performance Testing
+    query_vec = np.random.randn(384).astype(np.float32)
+    query_vec /= np.linalg.norm(query_vec)
     
-    results = []
-    def call_recall(idx):
-        start = time.perf_counter()
-        # This will trigger model loading on the first call
-        server.dispatch({
-            "method": "tools/call",
-            "params": {"name": "recall", "arguments": {"query": "test"}},
-            "id": idx
-        })
-        results.append(time.perf_counter() - start)
+    test_cases = [
+        ("No Filter (Brute-force)", None),
+        ("Metadata Filter (50% reduction)", "metadata LIKE '%work%'"),
+        ("Temporal Filter (Recent 1 year)", f"created_at > '{(datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')}'"),
+        ("Strict Filter (Small subset)", "metadata LIKE '%work%' AND created_at > '2024-01-01'")
+    ]
 
-    threads = [threading.Thread(target=call_recall, args=(i,)) for i in range(5)]
-    for t in threads: t.start()
-    for t in threads: t.join()
-    
-    print(f"Parallel calls (5) completed. Max latency: {max(results)*1000:.2f}ms")
+    print("\n--- Latency Results ---")
+    for label, filters in test_cases:
+        latencies = []
+        for _ in range(5): # 5 runs for average
+            start = time.time()
+            res = store.search("benchmark", query_vec, top_k=5, filters=filters)
+            latencies.append((time.time() - start) * 1000)
+        
+        avg_lat = sum(latencies) / len(latencies)
+        print(f"{label:<35}: {avg_lat:8.2f} ms")
 
 if __name__ == "__main__":
-    test_startup_latency()
-    test_search_efficiency(1000)
-    test_parallel_execution()
+    run_benchmark(100000)

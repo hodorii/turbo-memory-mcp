@@ -141,13 +141,18 @@ _LLOYD_MAX_CENTROIDS = {
 ```sql
 -- 기본 데이터 및 압축 벡터 저장
 CREATE TABLE entries (
-    id     TEXT PRIMARY KEY,
-    text   TEXT NOT NULL,
-    idx    BLOB NOT NULL,
-    norm   REAL NOT NULL,
-    qjl    BLOB NOT NULL,
-    r_norm REAL NOT NULL
+    id          TEXT PRIMARY KEY,
+    text        TEXT NOT NULL,
+    idx         BLOB NOT NULL,
+    norm        REAL NOT NULL,
+    qjl         BLOB NOT NULL,
+    r_norm      REAL NOT NULL,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    metadata    TEXT -- JSON string
 );
+
+-- 인덱스: 시간축 및 속성 기반 고속 필터링
+CREATE INDEX idx_entries_created_at ON entries(created_at);
 
 -- 고속 키워드 검색용 가상 테이블 (FTS5)
 CREATE VIRTUAL TABLE entries_fts USING fts5(
@@ -367,6 +372,25 @@ make serve  # 기본 포트 8765
 |------|------|------|
 | 벡터 차원 | 384 고정 | all-MiniLM-L6-v2 모델 출력 |
 | 양자화 비트 | 3-bit 고정 | 정확도/압축률 균형점 |
+| 검색 방식 | 전체 스캔 | ANN 인덱스 미구현 |
+| seed | 42 고정 | 재현성 보장 (변경 시 기존 DB 무효화) |
+
+### 7.3 확장 가능성
+
+- **다른 임베딩 모델**: `DIM` 변경 + state 재빌드
+- **다른 비트 수**: `BITS` 변경 + 코드북 선택
+- **ANN 인덱스**: FAISS/ScaNN 통합 (압축 벡터 직접 인덱싱)
+- **GPU 가속**: CUDA 커널로 회전/양자화 병렬화
+
+---
+
+## 8. 참고 자료
+
+- [TurboQuant paper (arXiv:2504.19874)](https://arxiv.org/abs/2504.19874)
+- [QJL paper (arXiv:2406.03482)](https://arxiv.org/abs/2406.03482)
+- [Vadim's blog: TurboQuant 3-bit KV cache](https://vadim.blog/turboquant-3-bit-kv-cache-zero-loss)
+- [MCP Protocol Spec (2024-11-05)](https://spec.modelcontextprotocol.io/)
+ 정확도/압축률 균형점 |
 | 검색 방식 | 전체 스캔 | ANN 인덱스 미구현 |
 | seed | 42 고정 | 재현성 보장 (변경 시 기존 DB 무효화) |
 

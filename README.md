@@ -1,141 +1,17 @@
-# turbo-memory-mcp
+# TurboMemory-MCP
 
-Compressed vector memory MCP server based on [TurboQuant (ICLR 2026)](https://arxiv.org/abs/2504.19874).
+**지능형 기억 관리 엔진: 조선왕조실록 및 역사적 맥락 학습 에이전트**
 
-Implements Google Research's TurboQuant algorithm to compress embedding vectors **~10x** while preserving inner product estimation accuracy for unbiased similarity search.
+이 프로젝트는 대규모 역사 데이터(조선왕조실록 등)를 기억하고, 지능적으로 관리(망각 및 침전)하며, 정확하게 인출하는 기억 엔진을 구축합니다.
 
-[한국어](README.ko.md)
+## 아키텍처 원칙 (First Principles)
+1. **데이터 정합성 우선**: 압축률보다 데이터의 물리적 무결성(FP32)과 차원 정합성을 최우선시합니다.
+2. **이원화 구조 (Hybrid Storage)**: 
+   - **SQLite**: 팩트(키워드), 시간, 중요도 등의 메타데이터 저장 (SSoT).
+   - **TurboQuant**: 벡터 의미론적 맥락 저장 및 내적 추정(Inner Product Estimation).
+3. **지능형 기억 관리 (Sedimentation)**: 모든 기억은 수명과 중요도에 따라 'Working'에서 'Archive'로 침전(Sediment)되어 시스템 효율을 최적화합니다.
 
-## Features
-
-- **Hybrid Search**: Combines **Vector Similarity (Semantic)** with **SQLite FTS5 (Keyword)** + **Morpheme Analysis** for maximum precision on technical symbols and proper nouns.
-- **Extreme Speed**: Optimized $O(N \cdot d)$ search path using pre-projection; 1000 items searched in < 10ms.
-- **Instant Initialize**: Lazy model loading ensures MCP servers start in 0ms, preventing client timeouts.
-- **Parallel Readiness**: Thread-safe execution using `ThreadPoolExecutor` and `RLock` for concurrent sub-agent access.
-- **Two-stage pipeline**: Random rotation + Lloyd-Max quantization (b-1 bits) → QJL residual correction (1 bit).
-- **Unbiased inner product**: QJL correction eliminates similarity search bias.
-- **Local embeddings**: `all-MiniLM-L6-v2` (sentence-transformers), no API key required.
-- **Multi-client safe**: SQLite WAL mode for concurrent access from multiple MCP clients.
-
-## Performance & Accuracy
-
-| Metric | Initial (Baseline) | Optimized (Current) | Improvement |
-|------|-------------------|----------------------|-------------|
-| **Startup Latency** | ~5,200ms | **< 1ms** | 5000x faster |
-| **Search (N=1000)** | ~100ms | **~9.4ms** | 10x faster |
-| **Technical Precision** | Moderate (Vector only) | **Extreme** (FTS5 Hybrid) | Corrected symbol matching |
-| **Korean Support** | Basic (Whitespace) | **Advanced** (Kiwipiepy) | Accurate particle separation |
-
-## Algorithm Deviations & Optimizations
-
-While strictly following the **TurboQuant (ICLR 2026)** mathematical core, this implementation introduces two major engineering optimizations:
-
-1. **Pre-projected Execution**: The paper suggests $O(d^2)$ projection during search. We pre-compute $\Pi \cdot q$ and $S \cdot q$ once per query, reducing the inner-loop complexity to $O(N \cdot d)$, making it scalable to tens of thousands of memories on a single CPU core.
-2. **Hybrid 80/20 Scoring**: We don't rely solely on semantic vectors. We use a weighted sum (80% Keyword / 20% Vector) to ensure that specific technical identifiers (like `TASK-01`) are never lost in the "semantic blur" of vector spaces.
-
-## Memory vs. RAG
-
-This tool is a specialized **Long-term Memory** system, differing from traditional RAG in three key ways:
-
-- **Compression**: Uses 3-bit TurboQuant to store 10x more memories in the same RAM footprint compared to standard RAG.
-- **Dynamism**: Designed for frequent `remember`/`forget` operations by the agent, unlike static document RAG.
-- **Precision**: Combines Morpheme-aware FTS5 with TurboQuant to handle technical symbols that often break standard semantic search.
-
-## File Structure
-
-```
-turbo_quant.py    — TurboQuant core (quantization + compressed inner product)
-memory_store.py   — Compressed vector store (SQLite WAL)
-server.py         — MCP server (JSON-RPC over stdio or HTTP)
-pyproject.toml    — Package definition for uvx
-```
-
-## Installation
-
-```bash
-# No venv needed — uvx handles isolation automatically
-uvx --from git+https://github.com/hodorii/turbo-memory-mcp turbo-memory-mcp
-```
-
-Or clone for local use:
-
-```bash
-git clone https://github.com/hodorii/turbo-memory-mcp
-cd turbo-memory-mcp
-make install
-make register   # registers in all supported MCP clients
-```
-
-## MCP Registration
-
-### stdio (default)
-
-```json
-"memory": {
-  "command": "uvx",
-  "args": ["--from", "/path/to/turbo-memory-mcp", "turbo-memory-mcp"]
-}
-```
-
-Supported config paths:
-- Kiro: `~/.kiro/settings/mcp.json`
-- Gemini CLI: `~/.gemini/settings.json`
-- Antigravity: `~/.gemini/antigravity/mcp_config.json`
-- opencode: `~/.config/opencode/opencode.json`
-
-### HTTP (for multi-client / sub-agent parallel access)
-
-```bash
-make serve          # default port 8765
-make serve PORT=9000
-```
-
-```json
-"memory": {
-  "type": "http",
-  "url": "http://127.0.0.1:8765"
-}
-```
-
-## MCP Tools
-
-| Tool | Description |
-|------|-------------|
-| `remember(text)` | Embed and store a memory (compressed) |
-| `remember(texts=[...])` | Batch store (single encode pass, faster) |
-| `recall(query, top_k?)` | Search similar memories |
-| `forget(id)` | Delete a memory |
-| `memory_stats()` | Show compression statistics |
-
-## Why TurboQuant?
-
-This implementation chooses **TurboQuant** over standard Product Quantization (PQ) for three mathematical reasons:
-1. **Unbiased Inner Product**: Standard quantization introduces systematic bias in similarity scores. TurboQuant's **QJL (Quantized Johnson-Lindenstrauss)** stage corrects this, ensuring $E[\text{estimated}] = \text{actual}$.
-2. **Information-Theoretic Optimality**: It achieves within 2.7x of the theoretical lower bound for MSE distortion, outperforming existing methods by orders of magnitude.
-3. **Data-oblivious**: Uses precomputed Lloyd-Max codebooks for a unit-sphere Beta distribution, requiring no expensive training or calibration on user data.
-
-## Core Algorithm: 2-Stage Pipeline
-
-We use a **3-bit per dimension** configuration, which provides a ~10.1x compression ratio with near-zero accuracy loss (matches FP16 performance).
-
-1. **Stage 1: Lloyd-Max Quantization (2-bits)**
-   - Applies a random orthogonal rotation $\Pi$ to map vectors to a near-Gaussian distribution.
-   - Quantizes coordinates using MSE-optimized centroids for the resulting Beta distribution.
-2. **Stage 2: QJL Residual Correction (1-bit)**
-   - Computes the residual $r = x - \hat{x}$.
-   - Stores only the **sign** of the residual after a Gaussian projection $S \cdot r$.
-   - This 1-bit correction is the key to removing the quantization bias during search.
-
-## Compression Specs (3-bit default)
-
-| Component | Bits per Dim | Total for 384-dim |
-|-----------|--------------|-------------------|
-| Stage 1 (Index) | 2 bits | 768 bits |
-| Stage 2 (QJL) | 1 bit | 384 bits |
-| Norms (Meta) | - | 64 bits (2x Float32) |
-| **Total** | **~3.16 bits** | **1216 bits** (vs 12288 FP32) |
-
-## References
-
-- [TurboQuant paper](https://arxiv.org/abs/2504.19874) — Zandieh et al., Google Research, ICLR 2026
-- [QJL paper](https://arxiv.org/abs/2406.03482) — 1-bit unbiased inner product quantization
+## 핵심 기술 스택
+- **Search**: Hybrid Search (FTS5 키워드 검색 + TurboQuant 벡터 유사도).
+- **Intelligence**: 에빙하우스 망각 곡선 기반의 Scoring 엔진.
+- **Data Integrity**: 명시적 차원 강제(Reshape)를 통한 차원 오염 원천 차단.

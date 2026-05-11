@@ -1,0 +1,5 @@
+/bench_test.db filter=lfs diff=lfs merge=lfs -text
+/final_verification.db filter=lfs diff=lfs merge=lfs -text
+/session_memory.db-wal filter=lfs diff=lfs merge=lfs -text
+/sillok_paper.db filter=lfs diff=lfs merge=lfs -text
+/sillok_paper_full.db filter=lfs diff=lfs merge=lfs -text

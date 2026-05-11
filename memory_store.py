@@ -1,209 +1,339 @@
 import sqlite3
+import json
 import numpy as np
-from typing import List, Tuple
-from math import exp
+import struct
+from datetime import datetime
+from math import exp, ceil
+from typing import List, Tuple, Optional, Literal
 
-from turbo_quant import TurboQuantState, build_state, compress, estimate_inner_product
+from turbo_quant import (
+    TurboQuantState, build_state, compress, prepare_query, estimate as estimate_a,
+)
+from turbo_quant_v2 import (
+    TurboQuantV2State, build_state_v2, compress_v2, prepare_query_v2, estimate_v2,
+)
+from turbo_quant_paper import (
+    TurboQuantState as TurboQuantPaperState,
+    compress as compress_paper,
+    prepare_query as prepare_query_paper,
+    estimate as estimate_paper,
+    estimate_preunpacked,
+    _unpack_numpy,
+    batch_search,
+)
 
 
 class MemoryStore:
-    # Common stopwords for English and Korean to improve BM25 relevance
-    STOPWORDS = {
-        # English
-        "a", "an", "the", "and", "or", "but", "if", "then", "is", "are", "was", "were",
-        "to", "for", "with", "at", "by", "from", "on", "in", "out", "of", "about",
-        # Korean
-        "은", "는", "이", "가", "을", "를", "의", "에", "와", "과", "도", "만", "에서",
-        "이다", "하고", "하고는", "그리고", "그래서", "하지만", "그런데",
-    }
+    """SQLite-backed memory with optional TurboQuant compression.
 
-    def __init__(self, path: str, dim: int = 384, bits: int = 3, seed: int = 42):
-        self.dim = dim
-        self.bits = bits
-        self.state: TurboQuantState = build_state(dim, bits, seed)
-        self._db = self._init_db(path)
-        # Initialize Kiwi for Korean morphological analysis
-        try:
-            from kiwipiepy import Kiwi
-            self.kiwi = Kiwi()
-        except:
-            self.kiwi = None
+    compression=None:  FP32 embeddings stored as raw float32 blobs
+    compression='algo_a':  Lloyd-Max 2-bit + QJL 1-bit
+    compression='algo_b':  3-bit levels + 1-bit residual sign/scale
+    compression='paper':  3-bit Beta Lloyd-Max + QJL + bit-packing
+    """
 
-    def _filter_stopwords(self, text: str) -> str:
-        """
-        Extract nouns and remove common stopwords.
-        Uses morphological analysis for Korean and simple tokenization for English.
-        """
-        # 1. Handle Korean with Kiwi if available
-        if self.kiwi:
-            # Extract nouns (NNG, NNP) and technical terms
-            analysis = self.kiwi.analyze(text)
-            tokens = []
-            for token, pos, _, _ in analysis[0][0]:
-                # NNG: General Noun, NNP: Proper Noun, SL: Foreign Language (English)
-                if pos in ('NNG', 'NNP', 'SL', 'SN'):
-                    if token.lower() not in self.STOPWORDS:
-                        tokens.append(token.lower())
-            
-            if tokens:
-                return " ".join(tokens)
+    def __init__(self, path: str, compression: Optional[Literal['algo_a', 'algo_b', 'paper']] = None):
+        self._db = sqlite3.connect(path, check_same_thread=False)
+        self.compression = compression
+        self._state_a: Optional[TurboQuantState] = None
+        self._state_b: Optional[TurboQuantV2State] = None
+        self._state_paper: Optional[TurboQuantPaperState] = None
+        self._paper_cache: dict = {}
+        self._paper_cache_loaded: bool = False
+        self._id_seq = 0
+        self._init_db()
 
-        # 2. Fallback for English or if Kiwi is missing
-        tokens = text.lower().split()
-        filtered = [t for t in tokens if t not in self.STOPWORDS]
-        return " ".join(filtered) if filtered else text
+    def _get_state_a(self) -> TurboQuantState:
+        if self._state_a is None:
+            self._state_a = build_state(dim=384, bits=3, seed=42)
+        return self._state_a
 
-    def _init_db(self, path: str) -> sqlite3.Connection:
-        db = sqlite3.connect(path, check_same_thread=False)
-        db.execute("PRAGMA journal_mode=WAL")
-        
-        # 1. Base table for compressed vectors
-        db.execute("""
+    def _get_state_b(self) -> TurboQuantV2State:
+        if self._state_b is None:
+            self._state_b = build_state_v2(dim=384, bits=3, seed=42)
+        return self._state_b
+
+    def _get_state_paper(self) -> TurboQuantPaperState:
+        if self._state_paper is None:
+            self._state_paper = TurboQuantPaperState.build(dim=384, b=3, seed=42)
+        return self._state_paper
+
+    def _init_db(self):
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("""
             CREATE TABLE IF NOT EXISTS entries (
-                id     TEXT PRIMARY KEY,
-                text   TEXT NOT NULL,
-                idx    BLOB NOT NULL,
-                norm   REAL NOT NULL,
-                qjl    BLOB NOT NULL,
-                r_norm REAL NOT NULL
+                id TEXT PRIMARY KEY,
+                text TEXT,
+                embedding BLOB,
+                compression TEXT DEFAULT 'fp32' NOT NULL,
+                importance REAL,
+                created_at TIMESTAMP,
+                category TEXT DEFAULT '',
+                source_ref TEXT DEFAULT '',
+                tags TEXT DEFAULT '',
+                metadata TEXT DEFAULT '{}'
             )
         """)
-
-        # 2. FTS5 Virtual Table for keyword search
+        # Migration: add columns if upgrading from old schema
+        for col, typ in [('category', 'TEXT DEFAULT \'\''),
+                         ('source_ref', 'TEXT DEFAULT \'\''),
+                         ('tags', 'TEXT DEFAULT \'\''),
+                         ('metadata', 'TEXT DEFAULT \'{}\'')]:
+            try:
+                self._db.execute(f"ALTER TABLE entries ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS archived_entries (
+                id TEXT PRIMARY KEY, summary TEXT, period_start TIMESTAMP
+            )
+        """)
         try:
-            db.execute("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
-                    id UNINDEXED,
-                    text,
-                    tokenize='unicode61' -- Better for mixed technical tokens
-                )
-            """)
-            # Triggers are removed to handle preprocessing in Python
-            db.execute("DROP TRIGGER IF EXISTS entries_ai")
-            db.execute("DROP TRIGGER IF EXISTS entries_ad")
-            db.execute("DROP TRIGGER IF EXISTS entries_au")
+            self._db.execute("ALTER TABLE entries ADD COLUMN compression TEXT DEFAULT 'fp32'")
         except sqlite3.OperationalError:
             pass
-            
-        db.commit()
-        return db
-
-    def _next_id(self) -> str:
-        res = self._db.execute("SELECT id FROM entries ORDER BY CAST(SUBSTR(id, 5) AS INTEGER) DESC LIMIT 1").fetchone()
-        if not res:
-            return "mem_000000"
-        last_num = int(res[0].split("_")[1])
-        return f"mem_{last_num + 1:06d}"
-
-    def add(self, text: str, embedding: np.ndarray) -> str:
-        idx, norm, qjl, r_norm = compress(embedding, self.state)
-        entry_id = self._next_id()
-        
-        # 1. Store base data
-        self._db.execute(
-            "INSERT OR REPLACE INTO entries (id, text, idx, norm, qjl, r_norm) VALUES (?,?,?,?,?,?)",
-            (entry_id, text,
-             idx.astype(np.int8).tobytes(), norm,
-             np.sign(qjl).astype(np.int8).tobytes(), r_norm)
-        )
-        
-        # 2. Store preprocessed text in FTS for precision matching
-        try:
-            clean_text = self._filter_stopwords(text)
-            self._db.execute(
-                "INSERT OR REPLACE INTO entries_fts (id, text) VALUES (?,?)",
-                (entry_id, clean_text)
-            )
-        except:
-            pass
-
+        self._db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(text)")
         self._db.commit()
+
+    # ── Compression ─────────────────────────────────────────────────────────
+
+    def _pack_algo_a(self, dim: int, idx: np.ndarray, norm: float,
+                     qjl: np.ndarray, r_norm: float) -> bytes:
+        return struct.pack(f'<I{dim}if{dim}if',
+                           dim, *idx.tolist(), norm, *qjl.tolist(), r_norm)
+
+    def _pack_algo_b(self, dim: int, indices: np.ndarray,
+                     signs: np.ndarray, scale: float) -> bytes:
+        return struct.pack(f'<I{dim}B{dim}be',
+                           dim, *indices.tolist(), *signs.tolist(), scale)
+
+    def _pack_paper(self, state: TurboQuantPaperState, packed_idx, norm, qjl, r_norm) -> bytes:
+        qjl_bytes = qjl.tobytes()
+        packed_bytes = packed_idx.tobytes()
+        header = struct.pack('<ii', len(qjl_bytes), len(packed_bytes))
+        return header + struct.pack('<ffi', norm, r_norm, len(qjl_bytes)) + qjl_bytes + packed_bytes
+
+    def _compress_vector(self, vec: np.ndarray) -> Tuple[bytes, str]:
+        if self.compression is None or self.compression == 'fp32':
+            return vec.astype(np.float32, copy=False).tobytes(), 'fp32'
+
+        if self.compression == 'algo_a':
+            state = self._get_state_a()
+            idx, norm, qjl, r_norm = compress(vec, state)
+            return self._pack_algo_a(state.dim, idx, norm, qjl, r_norm), 'algo_a'
+
+        if self.compression == 'algo_b':
+            state = self._get_state_b()
+            indices, signs, scale = compress_v2(vec, state)
+            return self._pack_algo_b(state.dim, indices, signs, scale), 'algo_b'
+
+        if self.compression == 'paper':
+            state = self._get_state_paper()
+            p_idx, norm, qjl, r_norm = compress_paper(vec, state)
+            return self._pack_paper(state, p_idx, norm, qjl, r_norm), 'paper'
+
+        raise ValueError(f"Unknown compression: {self.compression}")
+
+    def _score_algo_a(self, blob: bytes, q_rot: np.ndarray, q_qjl: np.ndarray) -> float:
+        dim = struct.unpack_from('<I', blob, 0)[0]
+        idx = np.frombuffer(blob, dtype=np.int32, count=dim, offset=4)
+        norm = struct.unpack_from('<f', blob, offset=4 + dim * 4)[0]
+        qjl = np.frombuffer(blob, dtype=np.int8, count=dim, offset=4 + dim * 4 + 4)
+        r_norm = struct.unpack_from('<f', blob, offset=4 + dim * 4 + 4 + dim * 1)[0]
+        return estimate_a(q_rot, q_qjl, self._get_state_a(), idx, norm, qjl, r_norm)
+
+    def _score_algo_b(self, blob: bytes, q_rot: np.ndarray) -> float:
+        dim = struct.unpack_from('<I', blob, 0)[0]
+        indices = np.frombuffer(blob, dtype=np.uint8, count=dim, offset=4)
+        signs = np.frombuffer(blob, dtype=np.int8, count=dim, offset=4 + dim * 1)
+        scale = struct.unpack_from('<e', blob, offset=4 + dim * 2)[0]
+        return estimate_v2(q_rot, self._get_state_b(), indices, signs, scale, query_norm=1.0)
+
+    def _score_paper(self, rowid: int, blob: bytes, q_rot: np.ndarray, q_qjl: np.ndarray) -> float:
+        cached = self._paper_cache.get(rowid)
+        if cached is not None:
+            indices, norm, qjl, r_norm = cached
+            return estimate_preunpacked(indices, norm, qjl, r_norm, self._get_state_paper(), q_rot, q_qjl)
+        n_qjl, n_packed = struct.unpack('<ii', blob[:8])
+        norm = struct.unpack_from('<f', blob, 8)[0]
+        r_norm = struct.unpack_from('<f', blob, 12)[0]
+        packed = np.frombuffer(blob[20+n_qjl:20+n_qjl+n_packed], dtype=np.uint8).copy()
+        indices = _unpack_numpy(packed, self._get_state_paper().dim)
+        qjl = np.frombuffer(blob[20:20+n_qjl], dtype=np.int8).copy()
+        self._paper_cache[rowid] = (indices, norm, qjl, r_norm)
+        return estimate_preunpacked(indices, norm, qjl, r_norm, self._get_state_paper(), q_rot, q_qjl)
+
+    # ── Paper Cache ──────────────────────────────────────────────────────────
+
+    def _ensure_paper_cache(self):
+        """Load all paper entries from DB, pre-unpack packed bits -> uint8 indices."""
+        if self._paper_cache_loaded:
+            return
+        self._paper_cache = {}
+        rows = self._db.execute(
+            "SELECT rowid, embedding FROM entries WHERE compression='paper'"
+        ).fetchall()
+        for rowid, blob in rows:
+            n_qjl, n_packed = struct.unpack('<ii', blob[:8])
+            norm = struct.unpack_from('<f', blob, 8)[0]
+            r_norm = struct.unpack_from('<f', blob, 12)[0]
+            qjl = np.frombuffer(blob[20:20+n_qjl], dtype=np.int8).copy()
+            packed = np.frombuffer(blob[20+n_qjl:20+n_qjl+n_packed], dtype=np.uint8).copy()
+            indices = _unpack_numpy(packed, self._get_state_paper().dim)
+            self._paper_cache[rowid] = (indices, norm, qjl, r_norm)
+        self._paper_cache_loaded = True
+
+    def _invalidate_paper_cache(self):
+        self._paper_cache_loaded = False
+        self._paper_cache = {}
+
+    # ── Query Projections ───────────────────────────────────────────────────
+
+    def _prepare_queries(self, query_vec: np.ndarray, rows: list):
+        has_a = any(r[4] == 'algo_a' for r in rows)
+        has_b = any(r[4] == 'algo_b' for r in rows)
+        has_paper = any(r[4] == 'paper' for r in rows)
+        q_a, q_qjl_a, q_b, q_qjl_p, q_rot_p = None, None, None, None, None
+        if has_a:
+            q_a, q_qjl_a = prepare_query(query_vec, self._get_state_a())
+        if has_b:
+            q_b = prepare_query_v2(query_vec, self._get_state_b())
+        if has_paper:
+            q_rot_p, q_qjl_p = prepare_query_paper(query_vec, self._get_state_paper())
+        return q_a, q_qjl_a, q_b, q_qjl_p, q_rot_p
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    def add(self, text: str, embedding: np.ndarray, metadata: dict = None,
+            importance: float = 0.5, commit: bool = True):
+        self._id_seq += 1
+        entry_id = f"mem_{int(datetime.now().timestamp())}_{self._id_seq}"
+        packed, algo = self._compress_vector(embedding)
+        self._invalidate_paper_cache()
+        # Extract typed fields from metadata, store raw metadata as JSON
+        category = (metadata or {}).pop('category', '')
+        source_ref = (metadata or {}).pop('source_ref', '')
+        tags = (metadata or {}).pop('tags', '')
+        meta_json = json.dumps(metadata or {}, ensure_ascii=False)
+        self._db.execute(
+            "INSERT INTO entries (id, text, embedding, compression, importance, created_at, category, source_ref, tags, metadata) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (entry_id, text, packed, algo, importance, datetime.now(),
+             category, source_ref, tags, meta_json))
+        self._db.execute("INSERT INTO entries_fts (text) VALUES (?)", (text,))
+        if commit:
+            self._db.commit()
         return entry_id
 
-    def search(self, query_text: str, query_vec: np.ndarray, top_k: int = 5) -> List[Tuple[str, str, float]]:
-        """
-        Hybrid Search: Vector Similarity (TurboQuant) + Keyword Matching (FTS5 BM25).
-        
-        1. Keyword Search (BM25):
-           - Uses SQLite FTS5 to find exact tokens/phrases.
-           - Crucial for technical symbols (e.g., function names, task IDs).
-           
-        2. Vector Search (Semantic):
-           - Uses TurboQuant compressed representations to find conceptual matches.
-           - O(N*d) complexity due to pre-projection of query.
-           
-        3. Scoring:
-           - Combines Vector Score (0.7 weight) and Keyword Score (0.3 weight).
-           - Exact keyword matches get a significant boost to ensure precision.
-        """
-        # 1. Keyword search (BM25) via FTS5
-        keyword_scores = {}
-        try:
-            # Preprocess: Lowercase, remove special chars, and filter stopwords
-            normalized_q = "".join(c if c.isalnum() or c.isspace() else " " for c in query_text.lower())
-            clean_q = self._filter_stopwords(normalized_q).strip()
-            # FTS5 works better with OR for multi-token search to increase recall
-            fts_q = " OR ".join(clean_q.split())
+    def sediment(self, threshold: float = 0.05):
+        now = datetime.now()
+        rows = self._db.execute(
+            "SELECT id, text, importance, created_at FROM entries").fetchall()
+        for rid, text, imp, ts in rows:
+            dt = datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S.%f")
+            score = imp * exp(-0.01 * (now - dt).days / max(0.1, imp))
+            if score < threshold:
+                self._db.execute("INSERT INTO archived_entries VALUES (?,?,?)",
+                                 (rid, text, ts))
+                self._db.execute("DELETE FROM entries WHERE id = ?", (rid,))
+                self._db.execute(
+                    "DELETE FROM entries_fts WHERE rowid = (SELECT rowid FROM entries_fts WHERE text = ? LIMIT 1)",
+                    (text,))
+        self._db.commit()
 
-            if fts_q:
-                # FTS5 MATCH provides high performance keyword lookup
-                fts_rows = self._db.execute(
-                    "SELECT id, bm25(entries_fts) FROM entries_fts WHERE text MATCH ? LIMIT 100",
-                    (fts_q,)
-                ).fetchall()
-                # bm25 in SQLite: lower is better (usually negative). 
-                # Normalize: Map roughly -1.0 or less to 1.0, and 0.0 to 0.0
-                for row_id, b_score in fts_rows:
-                    # bm25 is typically negative. Smaller (more negative) is a better match.
-                    # Increased sensitivity: -1.0 is now a full 1.0 score
-                    k_val = max(0.0, min(1.0, -b_score))
-                    keyword_scores[row_id] = k_val
-        except:
-            pass
-
-        # 2. Vector search (TurboQuant)
-        rows = self._db.execute("SELECT id, text, idx, norm, qjl, r_norm FROM entries").fetchall()
+    def search(self, query_text: str, query_vec: np.ndarray,
+               top_k: int = 5, filters: str = None) -> List[Tuple[str, str, float, dict]]:
+        query = "SELECT rowid, id, text, embedding, compression, importance, created_at, category, source_ref, tags, metadata FROM entries"
+        if filters:
+            query += f" WHERE {filters}"
+        rows = self._db.execute(query).fetchall()
         if not rows:
             return []
-        
-        from turbo_quant import prepare_query, estimate_inner_product
-        # Pre-project query once to rotate it into the same space as stored centroids
-        q_rot, q_qjl = prepare_query(query_vec, self.state)
+
+        now = datetime.now()
+        fts_scores = {}
+        try:
+            fts_rows = self._db.execute(
+                "SELECT rowid, bm25(entries_fts) FROM entries_fts WHERE text MATCH ? ORDER BY bm25(entries_fts) LIMIT 50",
+                (query_text,)).fetchall()
+            fts_scores = {row[0]: -row[1] for row in fts_rows}
+        except sqlite3.OperationalError:
+            pass
+
+        q_a, q_qjl_a, q_b, q_qjl_p, q_rot_p = self._prepare_queries(query_vec, rows)
+        query_norm = float(np.linalg.norm(query_vec))
 
         scored = []
-        for row_id, text, idx_blob, norm, qjl_blob, r_norm in rows:
-            v_score = estimate_inner_product(
-                self.state, q_rot, q_qjl,
-                np.frombuffer(idx_blob, dtype=np.int8).astype(np.int32), norm,
-                np.frombuffer(qjl_blob, dtype=np.int8).astype(np.float32), r_norm
-            )
-            
-            # 3. Hybrid scoring integration
-            k_score = keyword_scores.get(row_id, 0.0)
-            
-            # Final score: Keyword (0.8) for precision, Vector (0.2) for context
-            # High weight on keyword ensures exact matches (especially technical ones) rank first.
-            final_score = (k_score * 0.8) + (v_score * 0.2)
-            scored.append((row_id, text, final_score))
+        for r in rows:
+            rid, eid, text, blob, algo, imp, ts, cat, src, tags, meta_json = r
+            try:
+                if algo == 'fp32':
+                    vec = np.frombuffer(blob, dtype=np.float32)
+                    v_score = float(np.dot(query_vec, vec) / (
+                            query_norm * np.linalg.norm(vec) + 1e-9))
+                elif algo == 'algo_a':
+                    v_score = self._score_algo_a(blob, q_a, q_qjl_a)
+                elif algo == 'algo_b':
+                    v_score = self._score_algo_b(blob, q_b)
+                elif algo == 'paper':
+                    v_score = self._score_paper(rid, blob, q_rot_p, q_qjl_p)
+                else:
+                    continue
+            except Exception:
+                continue
 
-        # Rank by combined hybrid score
+            k_score = fts_scores.get(rid, 0.0)
+            hybrid_score = (k_score * 0.7) + (v_score * 0.3)
+            dt = datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S.%f")
+            score = hybrid_score * imp * exp(
+                -0.01 * (now - dt).days / max(0.1, imp))
+            try:
+                meta_dict = json.loads(meta_json) if meta_json else {}
+            except (json.JSONDecodeError, TypeError):
+                meta_dict = {}
+            scored.append((eid, text, score, {
+                'category': cat, 'source_ref': src, 'tags': tags,
+                'importance': imp, 'created_at': str(ts)[:19],
+                **meta_dict
+            }))
+
         scored.sort(key=lambda x: x[2], reverse=True)
         return scored[:top_k]
 
+    def recall_deep(self, query: str) -> List[str]:
+        return [r[0] for r in self._db.execute(
+            "SELECT summary FROM archived_entries WHERE summary LIKE ?",
+            (f'%{query}%',)).fetchall()]
+
     def delete(self, entry_id: str) -> bool:
-        # Sync with FTS table
-        self._db.execute("DELETE FROM entries_fts WHERE id=?", (entry_id,))
-        cur = self._db.execute("DELETE FROM entries WHERE id=?", (entry_id,))
+        self._db.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+        deleted = self._db.execute("SELECT changes()").fetchone()[0] > 0
         self._db.commit()
-        return cur.rowcount > 0
+        self._invalidate_paper_cache()
+        return deleted
 
     def stats(self) -> dict:
-        n = self._db.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
-        compressed_bits = n * ((self.bits - 1) * self.dim + self.dim + 64)
-        original_bits = n * self.dim * 32
+        count = self._db.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        modes = self._db.execute(
+            "SELECT compression, COUNT(*) FROM entries GROUP BY compression").fetchall()
+        byte_sizes = {
+    'fp32': 1536,
+    'algo_a': ceil(384 * 3 / 8) + 4 + 4 + 384 + 4,
+    'algo_b': 4 + 384 + 384 + 2,
+    'paper': 8 + 4 + 4 + 384 + ceil(384 * 3 / 8),
+}
+        total_fp32 = count * 1536
+        total_actual = sum(c * byte_sizes.get(m, 1536) for m, c in modes)
         return {
-            "entries": n,
-            "dim": self.dim,
-            "bits": self.bits,
-            "compression_ratio": round(original_bits / max(compressed_bits, 1), 2),
+            "total_entries": count,
+            "compression_modes": dict(modes),
+            "fp32_equivalent_bytes": total_fp32,
+            "actual_storage_bytes": total_actual,
+            "compression_ratio": round(total_fp32 / max(total_actual, 1), 2),
         }
+
+    def commit(self):
+        self._db.commit()
+
+    def close(self):
+        self._db.close()
