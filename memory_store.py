@@ -5,8 +5,9 @@ import struct
 from datetime import datetime
 from math import exp, ceil
 from typing import List, Tuple, Optional, Literal
-
+from concurrency import ConnectionPool, TransactionManager, RetryPolicy, DatabaseLockedError
 from turbo_quant import (
+
     TurboQuantState, build_state, compress, prepare_query, estimate as estimate_a,
 )
 from turbo_quant_v2 import (
@@ -25,15 +26,17 @@ from turbo_quant_paper import (
 
 class MemoryStore:
     """SQLite-backed memory with optional TurboQuant compression.
-
+    
     compression=None:  FP32 embeddings stored as raw float32 blobs
     compression='algo_a':  Lloyd-Max 2-bit + QJL 1-bit
     compression='algo_b':  3-bit levels + 1-bit residual sign/scale
     compression='paper':  3-bit Beta Lloyd-Max + QJL + bit-packing
     """
 
-    def __init__(self, path: str, compression: Optional[Literal['algo_a', 'algo_b', 'paper']] = None):
-        self._db = sqlite3.connect(path, check_same_thread=False)
+    def __init__(self, pool, retry_policy, compression: Optional[Literal['algo_a', 'algo_b', 'paper']] = None):
+        self._pool = pool
+        self._retry_policy = retry_policy
+        self._tm = TransactionManager(pool)
         self.compression = compression
         self._state_a: Optional[TurboQuantState] = None
         self._state_b: Optional[TurboQuantV2State] = None
@@ -43,57 +46,50 @@ class MemoryStore:
         self._id_seq = 0
         self._init_db()
 
-    def _get_state_a(self) -> TurboQuantState:
-        if self._state_a is None:
-            self._state_a = build_state(dim=384, bits=3, seed=42)
-        return self._state_a
-
-    def _get_state_b(self) -> TurboQuantV2State:
-        if self._state_b is None:
-            self._state_b = build_state_v2(dim=384, bits=3, seed=42)
-        return self._state_b
-
-    def _get_state_paper(self) -> TurboQuantPaperState:
-        if self._state_paper is None:
-            self._state_paper = TurboQuantPaperState.build(dim=384, b=3, seed=42)
-        return self._state_paper
-
     def _init_db(self):
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("""
-            CREATE TABLE IF NOT EXISTS entries (
-                id TEXT PRIMARY KEY,
-                text TEXT,
-                embedding BLOB,
-                compression TEXT DEFAULT 'fp32' NOT NULL,
-                importance REAL,
-                created_at TIMESTAMP,
-                category TEXT DEFAULT '',
-                source_ref TEXT DEFAULT '',
-                tags TEXT DEFAULT '',
-                metadata TEXT DEFAULT '{}'
-            )
-        """)
-        # Migration: add columns if upgrading from old schema
-        for col, typ in [('category', 'TEXT DEFAULT \'\''),
-                         ('source_ref', 'TEXT DEFAULT \'\''),
-                         ('tags', 'TEXT DEFAULT \'\''),
-                         ('metadata', 'TEXT DEFAULT \'{}\'')]:
+        def _init():
+            conn = self._pool.acquire()
             try:
-                self._db.execute(f"ALTER TABLE entries ADD COLUMN {col} {typ}")
-            except sqlite3.OperationalError:
-                pass
-        self._db.execute("""
-            CREATE TABLE IF NOT EXISTS archived_entries (
-                id TEXT PRIMARY KEY, summary TEXT, period_start TIMESTAMP
-            )
-        """)
-        try:
-            self._db.execute("ALTER TABLE entries ADD COLUMN compression TEXT DEFAULT 'fp32'")
-        except sqlite3.OperationalError:
-            pass
-        self._db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(text)")
-        self._db.commit()
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS entries (
+                        id TEXT PRIMARY KEY,
+                        text TEXT,
+                        embedding BLOB,
+                        compression TEXT DEFAULT 'fp32' NOT NULL,
+                        importance REAL,
+                        created_at TIMESTAMP,
+                        category TEXT DEFAULT '',
+                        source_ref TEXT DEFAULT '',
+                        tags TEXT DEFAULT '',
+                        metadata TEXT DEFAULT '{}'
+                    )
+                """)
+                # Migration: add columns if upgrading from old schema
+                for col, typ in [('category', 'TEXT DEFAULT \'\''),
+                                 ('source_ref', 'TEXT DEFAULT \'\''),
+                                 ('tags', 'TEXT DEFAULT \'\''),
+                                 ('metadata', 'TEXT DEFAULT \'{}\'')]:
+                    try:
+                        conn.execute(f"ALTER TABLE entries ADD COLUMN {col} {typ}")
+                    except sqlite3.OperationalError:
+                        pass
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS archived_entries (
+                        id TEXT PRIMARY KEY, summary TEXT, period_start TIMESTAMP
+                    )
+                """)
+                try:
+                    conn.execute("ALTER TABLE entries ADD COLUMN compression TEXT DEFAULT 'fp32'")
+                except sqlite3.OperationalError:
+                    pass
+                conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(text)")
+                conn.commit()
+            finally:
+                self._pool.release(conn)
+
+        self._retry_policy.execute_with_retry(_init)
+
 
     # ── Compression ─────────────────────────────────────────────────────────
 
@@ -205,123 +201,136 @@ class MemoryStore:
     # ── Public API ──────────────────────────────────────────────────────────
 
     def add(self, text: str, embedding: np.ndarray, metadata: dict = None,
-            importance: float = 0.5, commit: bool = True):
-        self._id_seq += 1
-        entry_id = f"mem_{int(datetime.now().timestamp())}_{self._id_seq}"
-        packed, algo = self._compress_vector(embedding)
-        self._invalidate_paper_cache()
-        # Extract typed fields from metadata, store raw metadata as JSON
-        category = (metadata or {}).pop('category', '')
-        source_ref = (metadata or {}).pop('source_ref', '')
-        tags = (metadata or {}).pop('tags', '')
-        meta_json = json.dumps(metadata or {}, ensure_ascii=False)
-        self._db.execute(
-            "INSERT INTO entries (id, text, embedding, compression, importance, created_at, category, source_ref, tags, metadata) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (entry_id, text, packed, algo, importance, datetime.now(),
-             category, source_ref, tags, meta_json))
-        self._db.execute("INSERT INTO entries_fts (text) VALUES (?)", (text,))
-        if commit:
-            self._db.commit()
-        return entry_id
+                importance: float = 0.5, commit: bool = True):
+        def _do_add():
+            with self._tm.transaction() as conn:
+                self._id_seq += 1
+                entry_id = f"mem_{int(datetime.now().timestamp())}_{self._id_seq}"
+                packed, algo = self._compress_vector(embedding)
+                self._invalidate_paper_cache()
+                category = (metadata or {}).pop('category', '')
+                source_ref = (metadata or {}).pop('source_ref', '')
+                tags = (metadata or {}).pop('tags', '')
+                meta_json = json.dumps(metadata or {}, ensure_ascii=False)
+                conn.execute(
+                    "INSERT INTO entries (id, text, embedding, compression, importance, created_at, category, source_ref, tags, metadata) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (entry_id, text, packed, algo, importance, datetime.now(),
+                     category, source_ref, tags, meta_json))
+                conn.execute("INSERT INTO entries_fts (text) VALUES (?)", (text,))
+                return entry_id
+
+        return self._retry_policy.execute_with_retry(_do_add)
 
     def sediment(self, threshold: float = 0.05):
-        now = datetime.now()
-        rows = self._db.execute(
-            "SELECT id, text, importance, created_at FROM entries").fetchall()
-        for rid, text, imp, ts in rows:
-            dt = datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S.%f")
-            score = imp * exp(-0.01 * (now - dt).days / max(0.1, imp))
-            if score < threshold:
-                self._db.execute("INSERT INTO archived_entries VALUES (?,?,?)",
-                                 (rid, text, ts))
-                self._db.execute("DELETE FROM entries WHERE id = ?", (rid,))
-                self._db.execute(
-                    "DELETE FROM entries_fts WHERE rowid = (SELECT rowid FROM entries_fts WHERE text = ? LIMIT 1)",
-                    (text,))
-        self._db.commit()
+        def _do_sediment():
+            with self._tm.transaction() as conn:
+                now = datetime.now()
+                rows = conn.execute(
+                    "SELECT id, text, importance, created_at FROM entries").fetchall()
+                for rid, text, imp, ts in rows:
+                    dt = datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S.%f")
+                    score = imp * exp(-0.01 * (now - dt).days / max(0.1, imp))
+                    if score < threshold:
+                        conn.execute("INSERT INTO archived_entries VALUES (?,?,?)",
+                                      (rid, text, ts))
+                        conn.execute("DELETE FROM entries WHERE id = ?", (rid,))
+                        conn.execute(
+                            "DELETE FROM entries_fts WHERE rowid = (SELECT rowid FROM entries_fts WHERE text = ? LIMIT 1)",
+                            (text,))
+        
+        self._retry_policy.execute_with_retry(_do_sediment)
 
     def search(self, query_text: str, query_vec: np.ndarray,
                top_k: int = 5, filters: str = None) -> List[Tuple[str, str, float, dict]]:
-        query = "SELECT rowid, id, text, embedding, compression, importance, created_at, category, source_ref, tags, metadata FROM entries"
-        if filters:
-            query += f" WHERE {filters}"
-        rows = self._db.execute(query).fetchall()
-        if not rows:
-            return []
+        def _do_search():
+            with self._tm.transaction() as conn:
+                query = "SELECT rowid, id, text, embedding, compression, importance, created_at, category, source_ref, tags, metadata FROM entries"
+                if filters:
+                    query += f" WHERE {filters}"
+                rows = conn.execute(query).fetchall()
+                if not rows:
+                    return []
 
-        now = datetime.now()
-        fts_scores = {}
-        try:
-            fts_rows = self._db.execute(
-                "SELECT rowid, bm25(entries_fts) FROM entries_fts WHERE text MATCH ? ORDER BY bm25(entries_fts) LIMIT 50",
-                (query_text,)).fetchall()
-            fts_scores = {row[0]: -row[1] for row in fts_rows}
-        except sqlite3.OperationalError:
-            pass
+                now = datetime.now()
+                fts_scores = {}
+                try:
+                    fts_rows = conn.execute(
+                        "SELECT rowid, bm25(entries_fts) FROM entries_fts WHERE text MATCH ? ORDER BY bm25(entries_fts) LIMIT 50",
+                        (query_text,)).fetchall()
+                    fts_scores = {row[0]: -row[1] for row in fts_rows}
+                except sqlite3.OperationalError:
+                    pass
 
-        q_a, q_qjl_a, q_b, q_qjl_p, q_rot_p = self._prepare_queries(query_vec, rows)
-        query_norm = float(np.linalg.norm(query_vec))
+                q_a, q_qjl_a, q_b, q_qjl_p, q_rot_p = self._prepare_queries(query_vec, rows)
+                query_norm = float(np.linalg.norm(query_vec))
 
-        scored = []
-        for r in rows:
-            rid, eid, text, blob, algo, imp, ts, cat, src, tags, meta_json = r
-            try:
-                if algo == 'fp32':
-                    vec = np.frombuffer(blob, dtype=np.float32)
-                    v_score = float(np.dot(query_vec, vec) / (
-                            query_norm * np.linalg.norm(vec) + 1e-9))
-                elif algo == 'algo_a':
-                    v_score = self._score_algo_a(blob, q_a, q_qjl_a)
-                elif algo == 'algo_b':
-                    v_score = self._score_algo_b(blob, q_b)
-                elif algo == 'paper':
-                    v_score = self._score_paper(rid, blob, q_rot_p, q_qjl_p)
-                else:
-                    continue
-            except Exception:
-                continue
+                scored = []
+                for r in rows:
+                    rid, eid, text, blob, algo, imp, ts, cat, src, tags, meta_json = r
+                    try:
+                        if algo == 'fp32':
+                            vec = np.frombuffer(blob, dtype=np.float32)
+                            v_score = float(np.dot(query_vec, vec) / (
+                                    query_norm * np.linalg.norm(vec) + 1e-9))
+                        elif algo == 'algo_a':
+                            v_score = self._score_algo_a(blob, q_a, q_qjl_a)
+                        elif algo == 'algo_b':
+                            v_score = self._score_algo_b(blob, q_b)
+                        elif algo == 'paper':
+                            v_score = self._score_paper(rid, blob, q_rot_p, q_qjl_p)
+                        else:
+                            continue
+                    except Exception:
+                        continue
 
-            k_score = fts_scores.get(rid, 0.0)
-            hybrid_score = (k_score * 0.7) + (v_score * 0.3)
-            dt = datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S.%f")
-            score = hybrid_score * imp * exp(
-                -0.01 * (now - dt).days / max(0.1, imp))
-            try:
-                meta_dict = json.loads(meta_json) if meta_json else {}
-            except (json.JSONDecodeError, TypeError):
-                meta_dict = {}
-            scored.append((eid, text, score, {
-                'category': cat, 'source_ref': src, 'tags': tags,
-                'importance': imp, 'created_at': str(ts)[:19],
-                **meta_dict
-            }))
+                    k_score = fts_scores.get(rid, 0.0)
+                    hybrid_score = (k_score * 0.7) + (v_score * 0.3)
+                    dt = datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S.%f")
+                    score = hybrid_score * imp * exp(
+                        -0.01 * (now - dt).days / max(0.1, imp))
+                    try:
+                        meta_dict = json.loads(meta_json) if meta_json else {}
+                    except (json.JSONDecodeError, TypeError):
+                        meta_dict = {}
+                    scored.append((eid, text, score, {
+                        'category': cat, 'source_ref': src, 'tags': tags,
+                        'importance': imp, 'created_at': str(ts)[:19],
+                        **meta_dict
+                    }))
 
-        scored.sort(key=lambda x: x[2], reverse=True)
-        return scored[:top_k]
-
-    def recall_deep(self, query: str) -> List[str]:
-        return [r[0] for r in self._db.execute(
-            "SELECT summary FROM archived_entries WHERE summary LIKE ?",
-            (f'%{query}%',)).fetchall()]
+                scored.sort(key=lambda x: x[2], reverse=True)
+                return scored[:top_k]
+        
+        return self._retry_policy.execute_with_retry(_do_search)
 
     def delete(self, entry_id: str) -> bool:
-        self._db.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
-        deleted = self._db.execute("SELECT changes()").fetchone()[0] > 0
-        self._db.commit()
-        self._invalidate_paper_cache()
-        return deleted
+        def _do_delete():
+            with self._tm.transaction() as conn:
+                conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+                deleted = conn.execute("SELECT changes()").fetchone()[0] > 0
+                self._invalidate_paper_cache()
+                return deleted
+        
+        return self._retry_policy.execute_with_retry(_do_delete)
+
+
 
     def stats(self) -> dict:
-        count = self._db.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
-        modes = self._db.execute(
-            "SELECT compression, COUNT(*) FROM entries GROUP BY compression").fetchall()
+        def _do_stats():
+            with self._tm.transaction() as conn:
+                count = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+                modes = conn.execute(
+                    "SELECT compression, COUNT(*) FROM entries GROUP BY compression").fetchall()
+                return count, modes
+
+        count, modes = self._retry_policy.execute_with_retry(_do_stats)
         byte_sizes = {
-    'fp32': 1536,
-    'algo_a': ceil(384 * 3 / 8) + 4 + 4 + 384 + 4,
-    'algo_b': 4 + 384 + 384 + 2,
-    'paper': 8 + 4 + 4 + 384 + ceil(384 * 3 / 8),
-}
+            'fp32': 1536,
+            'algo_a': ceil(384 * 3 / 8) + 4 + 4 + 384 + 4,
+            'algo_b': 4 + 384 + 384 + 2,
+            'paper': 8 + 4 + 4 + 384 + ceil(384 * 3 / 8),
+        }
         total_fp32 = count * 1536
         total_actual = sum(c * byte_sizes.get(m, 1536) for m, c in modes)
         return {
@@ -331,6 +340,7 @@ class MemoryStore:
             "actual_storage_bytes": total_actual,
             "compression_ratio": round(total_fp32 / max(total_actual, 1), 2),
         }
+
 
     def commit(self):
         self._db.commit()

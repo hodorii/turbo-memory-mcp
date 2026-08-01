@@ -9,9 +9,11 @@ from sentence_transformers import SentenceTransformer
 from mcp.server.fastmcp import FastMCP
 
 from memory_store import MemoryStore
+from concurrency import ConnectionPool, RetryPolicy
 
 STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_memory.db")
 DIM = 384
+MODEL_NAME = "intfloat/multilingual-e5-small"
 
 COMPRESS = None
 for arg in sys.argv:
@@ -22,7 +24,9 @@ for arg in sys.argv:
     elif arg == '--compress=paper':
         COMPRESS = 'paper'
 
-_store: MemoryStore = MemoryStore(path=STORE_PATH, compression=COMPRESS)
+_pool = ConnectionPool(path=STORE_PATH, pool_size=10, busy_timeout=5000)
+_retry_policy = RetryPolicy()
+_store = MemoryStore(pool=_pool, retry_policy=_retry_policy, compression=COMPRESS)
 _encoder: SentenceTransformer | None = None
 _model_lock = threading.RLock()
 _executor = ThreadPoolExecutor(max_workers=10)
@@ -33,17 +37,31 @@ def get_encoder() -> SentenceTransformer:
     if _encoder is None:
         with _model_lock:
             if _encoder is None:
-                _encoder = SentenceTransformer('all-MiniLM-L6-v2')
+                _encoder = SentenceTransformer(MODEL_NAME)
     return _encoder
 
 
 @lru_cache(maxsize=1000)
 def encode(text: str) -> np.ndarray:
+    # E5 모델은 query/passage prefix 필요
     return get_encoder().encode(text, normalize_embeddings=True).astype(np.float32)
 
 
 def encode_batch(texts: list[str]) -> np.ndarray:
     return get_encoder().encode(texts, normalize_embeddings=True, batch_size=64).astype(np.float32)
+
+
+def encode_passage(text: str) -> np.ndarray:
+    return encode(f"passage: {text}")
+
+
+def encode_passage_batch(texts: list[str]) -> np.ndarray:
+    prefixed = [f"passage: {t}" for t in texts]
+    return encode_batch(prefixed)
+
+
+def encode_query(text: str) -> np.ndarray:
+    return encode(f"query: {text}")
 
 
 # ── MCP Server ────────────────────────────────────────────────────────────
@@ -52,7 +70,8 @@ mcp = FastMCP(
     "turbo-memory-mcp",
     instructions="TurboQuant-compressed vector memory store for MCP. "
                  "Store and retrieve memories using hybrid vector + FTS5 search. "
-                 f"Compression mode: {'FP32' if COMPRESS is None else COMPRESS}.",
+                 f"Compression mode: {'FP32' if COMPRESS is None else COMPRESS}. "
+                 f"Embedding model: {MODEL_NAME} (multilingual, 384-dim).",
     host="127.0.0.1",
     port=8765,
 )
@@ -91,9 +110,8 @@ def remember(
     if source_ref:
         meta['source_ref'] = source_ref
 
-    embeddings = encode_batch(entries)
+    embeddings = encode_passage_batch(entries)
     ids = [_store.add(t, e, dict(meta), importance) for t, e in zip(entries, embeddings)]
-    _store.commit()
     return json.dumps({"ids": ids, "stored": len(ids)})
 
 
@@ -111,7 +129,7 @@ def recall(
         filters: Optional SQL WHERE clause for filtering
             (e.g., "category='source_code'" or "tags LIKE '%eden%'").
     """
-    q = encode(query)
+    q = encode_query(query)
     results = _store.search(query, q, top_k=top_k, filters=filters)
     return json.dumps({
         "results": [
