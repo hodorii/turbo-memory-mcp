@@ -1,0 +1,5 @@
+# Enable target-specific CPU optimizations for maximum SIMD/AVX2 performance.
+# Only applies to x86_64 (macOS Intel / Linux). Apple Silicon uses its own
+# NEON path via the `wide` crate and does not need this flag.
+[target.'cfg(all(target_arch = "x86_64"))']
+rustflags = ["-C", "target-cpu=native"]
