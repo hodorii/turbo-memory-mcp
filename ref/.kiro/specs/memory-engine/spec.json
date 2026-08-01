@@ -1,0 +1,8 @@
+{
+  "schema": "kiro-spec-v1",
+  "feature": "memory-engine",
+  "created": "2026-05-09T12:00:00+09:00",
+  "language": "en",
+  "status": "init",
+  "project_description": "Hybrid memory engine combining FAISS (FlatIP inner product index) with SQLite persistent storage and BGE-M3 sentence embeddings (1024-dim) for semantic search over Korean historical texts."
+}

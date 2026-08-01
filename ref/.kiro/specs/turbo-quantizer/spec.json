@@ -1,0 +1,27 @@
+{
+  "schema": "kiro-spec-v1",
+  "feature": "turbo-quantizer",
+  "created": "2026-05-09T12:00:00+09:00",
+  "updated_at": "2026-05-09T13:00:00+09:00",
+  "language": "en",
+  "status": "tasks-generated",
+  "project_description": "Vector quantization engine for compressing high-dimensional embeddings using random-rotation-based scalar quantization. Provides V1 (simple 3-bit), V2 (3-bit + 1-bit residual), and V3 (EDEN-based with optimal scaling, Lloyd-Max codebook, DRIVE residual).",
+  "approvals": {
+    "requirements": {
+      "approved": true,
+      "approved_at": "2026-05-09T12:30:00+09:00"
+    },
+    "design": {
+      "generated": true,
+      "generated_at": "2026-05-09T12:45:00+09:00",
+      "approved": true,
+      "approved_at": "2026-05-09T13:00:00+09:00"
+    },
+    "tasks": {
+      "generated": true,
+      "generated_at": "2026-05-09T13:00:00+09:00",
+      "approved": true,
+      "approved_at": "2026-05-09T13:00:00+09:00"
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "schema": "kiro-spec-v1",
+  "feature": "turbo-disk-store",
+  "created": "2026-05-09T12:00:00+09:00",
+  "language": "en",
+  "status": "init",
+  "project_description": "Disk-backed compressed memory store using TurboQuantizer V2 quantization. Stores compressed vectors (indices + signs + scales) via numpy memmap and provides LUT (Look-Up Table) based fast approximate search."
+}

@@ -1,0 +1,7 @@
+{
+  "schema": "kiro-spec-v1",
+  "feature": "sillok-ingestion",
+  "created": "2026-05-09T12:00:00+09:00",
+  "language": "en",
+  "project_description": "Data ingestion pipeline for parsing, embedding, and indexing Joseon Wangjo Sillok (Joseon Annals) XML data into the TurboQuant storage systems. Supports both TurboDiskStore and MemoryEngine backends."
+}

@@ -1,0 +1,65 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode/minimax-m2.5-free",
+  "plugin": [
+    "oh-my-opencode@latest",
+    "opencode-google-antigravity-auth",
+    "opencode-worktree",
+    "opencode-scheduler"
+  ],
+  "mcp": {
+    "sequential-thinking": {
+      "type": "local",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"]
+    },
+    "stitch": {
+      "type": "remote",
+      "url": "https://stitch.googleapis.com/mcp",
+      "enabled": true,
+      "headers": {
+        "X-Goog-Api-Key": "{env:STITCH_API_KEY}"
+      }
+    },
+    "arxiv": {
+      "type": "local",
+      "command": ["uvx", "arxiv-mcp-server"],
+      "volumes": {
+        "/Users/hodorii/dev/plaground_mcp/papers": "/papers"
+      }
+    },
+    "kis-trading-mcp-go": {
+      "type": "local",
+      "command": [""]
+    },
+    "naver-finance": {
+      "type": "local",
+      "command": ["/Users/hodorii/dev/stocks/bin/naver-finance-mcp"]
+    },
+    "yahoo-finance": {
+      "type": "local",
+      "command": ["uvx", "mcp-yahoo-finance"]
+    },
+    "opendart": {
+      "type": "local",
+      "command": ["uvx", "opendart-mcp"],
+      "environment": {
+        "OPENDART_API_KEY": "{env:OPENDART_API_KEY}"
+      }
+    },
+    "xactions": {
+      "type": "local",
+      "command": ["node", "/Users/hodorii/dev/mcp-servers/XActions/src/mcp/server.js"],
+      "environment": {
+        "XACTIONS_SESSION_COOKIE": "{env:XACTIONS_SESSION_COOKIE}"
+      }
+    },
+    "linkedin": {
+      "type": "local",
+      "command": ["uv", "--directory", "/Users/hodorii/dev/mcp-servers/linkedin-mcp-server", "run", "-m", "linkedin_mcp_server"]
+    },
+    "telegram": {
+      "type": "local",
+      "command": ["uv", "--directory", "/Users/hodorii/dev/mcp-servers/telegram-mcp", "run", "telegram-mcp"]
+    }
+  }
+}
